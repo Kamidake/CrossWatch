@@ -1,0 +1,3330 @@
+# cw_platform/config_base.py
+# configuration management base.
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+from __future__ import annotations
+
+import copy
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+import base64
+import hashlib
+import threading
+from contextlib import contextmanager
+from datetime import datetime
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import Any, cast
+from urllib.parse import urlsplit
+
+from cw_platform.profile_preferences import clean_user_preferences
+
+
+def _current_version_norm() -> str:
+    try:
+        from api.versionAPI import CURRENT_VERSION as _V
+        raw = str(_V)
+    except Exception:
+        raw = (os.getenv("APP_VERSION") or "v0.7.0").strip()
+    return raw[1:] if raw.lower().startswith("v") else raw
+
+
+def CONFIG_BASE() -> Path:
+    env = os.getenv("CONFIG_BASE")
+    if env:
+        return Path(env)
+
+    if Path("/app").exists():
+        # In container image mount /config as a writable volume
+        return Path("/config")
+    return Path(__file__).resolve().parents[1]
+
+
+CONFIG: Path = CONFIG_BASE()
+CONFIG.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_SCHEDULER_WEBHOOKS: dict[str, Any] = {
+    "enabled": False,
+    "url": "",
+    "base_url": "",
+    "start_url": "",
+    "success_url": "",
+    "failure_url": "",
+    "payload_format": "crosswatch",
+    "notifiarr_channel_id": "",
+    "pushover_token": "",
+    "pushover_user": "",
+    "timeout_seconds": 10,
+    "alert_on_unresolved": False,
+    "alert_on_watcher": False,
+    "alert_on_provider_auth": False,
+}
+
+_ENC_PREFIX = "enc:v1:"
+_CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_STATE = threading.local()
+_KEY_CACHE_LOCK = threading.Lock()
+_KEY_CACHE: dict[tuple[Any, ...], bytes] = {}
+_CIPHER_CACHE: dict[bytes, Any] = {}
+_CFG_CACHE_LOCK = threading.Lock()
+_CFG_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+def _config_key_file() -> Path:
+    return CONFIG / ".cw_master_key"
+
+def _normalize_fernet_key(raw: str | bytes) -> bytes:
+    data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+    data = data.strip()
+    if not data:
+        raise ValueError("Empty config key")
+
+    try:
+        decoded = base64.urlsafe_b64decode(data)
+        if len(decoded) == 32:
+            return data
+    except Exception:
+        pass
+
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+
+
+def _load_config_key(*, create: bool) -> bytes | None:
+    for env_key in ("CW_CONFIG_KEY", "CROSSWATCH_CONFIG_KEY"):
+        raw = (os.getenv(env_key) or "").strip()
+        if raw:
+            return _normalize_fernet_key(raw)
+
+    key_path = _config_key_file()
+    try:
+        st = key_path.stat()
+        stamp: tuple[Any, ...] | None = (str(key_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None:
+        with _KEY_CACHE_LOCK:
+            cached = _KEY_CACHE.get(stamp)
+        if cached is not None:
+            return cached
+        raw = key_path.read_text(encoding="utf-8")
+        _apply_owner_mode(key_path, _ownership_reference(_cfg_file()), mode=0o600)
+        key = _normalize_fernet_key(raw)
+        with _KEY_CACHE_LOCK:
+            _KEY_CACHE.clear()
+            _KEY_CACHE[stamp] = key
+        return key
+
+    if not create:
+        return None
+
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as e:
+        raise RuntimeError("Missing dependency: cryptography is required for encrypted config support") from e
+
+    key = Fernet.generate_key()
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_text(key.decode("ascii"), encoding="utf-8")
+    _apply_owner_mode(key_path, _ownership_reference(_cfg_file()), mode=0o600)
+    return key
+
+
+def _get_cipher(*, create: bool):
+    key = _load_config_key(create=create)
+    if not key:
+        return None
+    with _KEY_CACHE_LOCK:
+        cipher = _CIPHER_CACHE.get(key)
+    if cipher is not None:
+        return cipher
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as e:
+        raise RuntimeError("Missing dependency: cryptography is required for encrypted config support") from e
+    cipher = Fernet(key)
+    with _KEY_CACHE_LOCK:
+        _CIPHER_CACHE.clear()
+        _CIPHER_CACHE[key] = cipher
+    return cipher
+
+
+def _encrypt_secret(value: str) -> str:
+    s = str(value or "")
+    if not s or s.startswith(_ENC_PREFIX):
+        return s
+
+    cipher = _get_cipher(create=True)
+    if cipher is None:
+        return s
+
+    token = cipher.encrypt(s.encode("utf-8")).decode("ascii")
+    return f"{_ENC_PREFIX}{token}"
+
+
+def _decrypt_secret(value: Any) -> Any:
+    if not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
+        return value
+
+    cipher = _get_cipher(create=False)
+    if cipher is None:
+        raise RuntimeError(
+            f"Encrypted config detected but no key is available. Expected {_config_key_file()} "
+            "or env CW_CONFIG_KEY/CROSSWATCH_CONFIG_KEY"
+        )
+
+    token = value[len(_ENC_PREFIX):].strip()
+    try:
+        return cipher.decrypt(token.encode("ascii")).decode("utf-8")
+    except Exception as e:
+        raise RuntimeError("Encrypted config detected but decryption failed. Check the config key.") from e
+
+
+def _is_sensitive_path(path: tuple[str, ...]) -> bool:
+    if not path:
+        return False
+
+    clean: list[str] = [
+        str(part or "").strip().lower()
+        for part in path
+        if str(part or "").strip()
+    ]
+    if not clean:
+        return False
+
+    if len(clean) >= 2 and clean[0] == "security" and clean[1] == "webhook_ids":
+        return True
+
+    if len(clean) >= 3 and clean[0] == "scheduling" and clean[1] == "webhooks":
+        if clean[-1] in {"url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url", "pushover_token", "pushover_user"}:
+            return True
+
+    leaf = clean[-1]
+    exact = {
+        "api_key", "apikey",
+        "access_token", "refresh_token",
+        "client_secret",
+        "account_token", "pms_token", "home_pin",
+        "session_id",
+        "token_hash", "token_digest", "salt", "hash",
+        "device_code",
+        "pending_secret",
+        "_pending_request_token",
+        "_pending_tv_login",
+        "_pending_tv_caller",
+        "request_token",
+        "token",
+        "auth_key",
+        "authkey",
+        "password",
+        "secret",
+        "webhook_secret",
+        "webhook_url",
+    }
+    if leaf in exact:
+        return True
+
+    if leaf.endswith("_token") and leaf not in {"token_endpoint", "token_url"}:
+        return True
+
+    return False
+
+
+def _transform_secret_tree(obj: Any, *, decrypt: bool, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(obj, dict):
+        return {k: _transform_secret_tree(v, decrypt=decrypt, path=path + (str(k),)) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [_transform_secret_tree(v, decrypt=decrypt, path=path + (str(i),)) for i, v in enumerate(obj)]
+
+    if isinstance(obj, str) and _is_sensitive_path(path):
+        return _decrypt_secret(obj) if decrypt else _encrypt_secret(obj)
+
+    return obj
+
+
+def _encrypt_secret_tree_stable(obj: Any, prev: Any, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(obj, dict):
+        prev_d = prev if isinstance(prev, dict) else {}
+        return {k: _encrypt_secret_tree_stable(v, prev_d.get(k), path + (str(k),)) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        prev_l = prev if isinstance(prev, list) else []
+        return [
+            _encrypt_secret_tree_stable(v, prev_l[i] if i < len(prev_l) else None, path + (str(i),))
+            for i, v in enumerate(obj)
+        ]
+
+    if isinstance(obj, str) and _is_sensitive_path(path):
+        if isinstance(prev, str) and prev.startswith(_ENC_PREFIX):
+            try:
+                if _decrypt_secret(prev) == obj:
+                    return prev
+            except Exception:
+                pass
+        return _encrypt_secret(obj)
+
+    return obj
+
+# Default config
+DEFAULT_CFG: dict[str, Any] = {
+    "user_profiles": {},
+    "provider_instance_ids": {},
+
+    # --- Providers -----------------------------------------------------------
+    "plex": {
+        "server_url": "",                               # http(s)://host:32400 (required for sync & watcher).
+        "verify_ssl": False,                            # Verify TLS certificates
+        "account_token": "",                            # Plex token (a.k.a. authentication token).
+        "pms_token": "",                                # PMS resource token for the selected server
+        "client_id": "",                                # Set by PIN login; reused for headers.
+        "machine_id": "",                               # PMS machineIdentifier (UUID).
+        "username": "",                                 # Preferred Plex Home user/profile.
+        "account_id": "",                               # Server-local accountID (int) for the selected user. 
+        "home_pin": "",                                 # Plex Home PIN for the selected profile (optional).
+        "timeout": 10.0,                                # Optional HTTP timeout (seconds).
+        "max_retries": 3,                               # Optional retry budget.
+        "fallback_GUID": False,
+
+        "scrobble": {
+            "libraries": [],                            # Whitelist of library IDs for scrobble (webhook/watch); empty = all
+        },
+
+        "history": {
+            "libraries": [],                            # Whitelist of library GUIDs; empty = all
+            "include_marked_watched": True,             # Include items manually marked as watched in Plex
+            "read_cloud_history": False,                # Include account-wide Plex cloud watch history when reading
+            "discover_fallback": False,                 # Include account-wide Plex cloud watch history when writing
+        },
+        "progress": {
+            "libraries": [],                            # Whitelist for resumable items; empty = all
+        },
+        "ratings": {
+            "libraries": [],                            # Whitelist of library GUIDs; empty = all
+        },
+
+        # Ratings / History
+        "rating_workers": 12,                           # Parallel workers for Plex ratings indexing. 12–16 is ideal on a local NAS.
+        "history_workers": 12,                          # Parallel workers for Plex history indexing. 12–16 is ideal on a local NAS.
+
+        # Watchlist via Discover (with PMS fallback toggle)
+        "watchlist_allow_pms_fallback": False,          # Allow PMS watchlist fallback when needed. Keep False for strict Discover-only behavior.
+        "watchlist_page_size": 100,                     # Discover page size (100-200). Higher = faster, but more risk of 504 timeouts.
+        "watchlist_query_limit": 25,                    # Max Discover search results per query (10–25). Lower = faster, 25 = safer.
+        "watchlist_write_delay_ms": 0,                  # Optional pacing between Discover writes; set 50–150 if you hit 429/5xx.
+        "watchlist_title_query": True,                  # Use title/slug tokens for Discover candidate fetching (Discover is text-only).
+        "watchlist_use_metadata_match": True,           # Try METADATA /library/metadata/matches with tmdb-/imdb-/tvdb- first; fallback to Discover.
+        "watchlist_guid_priority": [                    # GUID resolution order (first match wins).
+            "tmdb", "imdb", "tvdb",
+            "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
+        ],
+    },
+
+    "simkl": {
+        "access_token": "",                             # OAuth2 / PIN access token
+        "refresh_token": "",
+        "token_expires_at": 0,
+        "auth_method": "",                              # "pin" | "oauth" (metadata; runtime uses access_token + client_id)
+        "client_id": "",                                # From your Simkl app (OAuth); baked app id when connected via PIN
+        "client_secret": "",                            # From your Simkl app
+        "date_from": "",                                # YYYY-MM-DD (optional start date for full sync)
+        "watchlist_batch_size": 500,                    # Batch size for watchlist add/remove writes
+        "ratings_chunk_size": 500,                      # Batch size for ratings add/remove writes
+        "history_chunk_size": 500,                      # Batch size for history add/remove writes
+
+        # Rate limits
+        "rate_limit": {
+            "post_per_sec": 1,
+            "get_per_sec": 2,
+        },
+    },
+    
+    "kitsu": {
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "scope": "",
+        "user": {},
+        "reauth_required": False,
+    },
+    "anilist": {
+        "client_id": "",                                # From your AniList app
+        "client_secret": "",                            # From your AniList app
+        "access_token": "",                             # OAuth access token (saved after auth)
+        "user": {},                                     # Viewer object (id/name)
+        "rate_limit": {
+            "post_per_sec": 0.45,
+        },
+    },
+
+    "mdblist": {
+        "auth_method": "",                              # "", "device_code" (default when new), or "api_key" (legacy/manual)
+        "client_id": "",                                # Deprecated; CrossWatch MDBList app client_id is supplied internally
+        "access_token": "",                             # OAuth access token (Device Code)
+        "refresh_token": "",                            # OAuth refresh token (Device Code)
+        "token_type": "Bearer",                         # OAuth token type
+        "scope": "write",                               # MDBList OAuth scope
+        "expires_at": 0,                                # Epoch when access_token expires
+        "api_key": "",                                  # Your MDBList API key
+        "timeout": 10,                                  # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget
+
+        # Rate limits 
+        "rate_limit": {
+            "post_per_sec": 1,
+            "get_per_sec": 10,
+        },
+
+        # Watchlist
+        "watchlist_shadow_ttl_hours": 0,                # Shadow TTL (hours); 0 = disabled
+        "watchlist_shadow_validate": True,              # Validate shadow on every run
+        "watchlist_page_size": 1000,                    # GET page size for /watchlist/items
+        "watchlist_batch_size": 500,                    # Batch size for add/remove writes
+        "watchlist_freeze_details": True,               # Store extra details for "not_found" freezes
+
+        # Ratings
+        "ratings_per_page": 1000,                       # Items per page when indexing
+        "ratings_chunk_size": 500,                      # Batch size for POST/REMOVE
+        "ratings_write_delay_ms": 600,                  # Optional pacing between writes
+        "ratings_max_backoff_ms": 8000,                 # Max backoff time for retries
+        "ratings_since": "1900-01-01T00:00:02Z",        # First-run baseline; watermark overrides after
+
+        # History
+        "history_per_page": 1000,                       # Items per page for /sync/watched delta
+        "history_chunk_size": 500,                      # Batch size for watched/unwatched writes
+        "history_write_delay_ms": 600,                  # Optional pacing between writes
+        "history_max_backoff_ms": 8000,                 # Max backoff time for retries
+        "history_since": "1900-01-01T00:00:02Z"         # First-run baseline; watermark overrides after
+    },
+
+        "publicmetadb": {
+        "api_key": "",                                  # PublicMetaDB API key (pm-...)
+        "base_url": "https://publicmetadb.com",         # External API base URL
+        "timeout": 15.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget
+        "watchlist_list_id": "",                        # Optional list id; empty = discover/create
+        "watchlist_name": "Watchlist",                  # Default PublicMetaDB list name; pair config can override
+        "watchlist_auto_create": True,                  # Create a private CrossWatch watchlist if missing
+        "watchlist_page_size": 500,                     # GET page size for list items
+        "history_per_page": 500,                        # GET page size for watched history
+        "progress_per_page": 500,                       # GET page size for resume/progress
+        "ratings_label": "Overall",                     # PublicMetaDB rating label used by CrossWatch
+        "ratings_submit_per_hour": 200,                 # PublicMetaDB contribution limit for rating creates
+        "ratings_update_per_hour": 100,                 # PublicMetaDB contribution limit for rating updates
+        "rate_limit": {
+            "post_per_sec": 3,
+            "get_per_sec": 20,
+        },
+    },
+
+    "myanimelist": {
+        "auth_method": "hosted_oauth",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "auth_broker": "",
+        "reauth_required": False,
+    },
+
+    "wetrakr": {
+        "auth_method": "pkce",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "plan": "",
+        "reauth_required": False,
+    },
+
+    "punchplay": {
+        "auth_method": "device_code",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "bearer",
+        "scope": "",
+        "expires_at": 0,
+        "refresh_expires_at": 0,
+        "username": "",
+        "user_id": "",
+        "device_id": "",
+        "timeout": 20.0,
+        "max_retries": 3,
+        "history_per_page": 100,
+        "rate_limit": {
+            "get_per_sec": 2.0,
+            "post_per_sec": 0.5,
+            "bulk_per_min": 30,
+            "playback_per_5min": 120,
+            "sync_read_per_min": 120,
+        },
+    },
+
+    "bingebase": {
+        "auth_method": "device_code",
+        "access_token": "",
+        "username": "",
+        "user_id": "",
+        "webhook_url": "",
+        "api_key": "",
+        "timeout": 20.0,
+    },
+
+    "flicklist": {
+        "auth_method": "device_code",
+        "api_key": "",
+        "access_token": "",
+        "token": "",
+        "credential": "",
+        "client_id": "",                                # Optional override; CrossWatch FlickList app client_id is supplied internally
+        "expires_at": 0,
+        "stored_at": 0,
+        "username": "",
+        "user_id": "",
+        "display_name": "",
+        "avatar_url": "",
+        "timeout": 20.0,
+        "max_retries": 3,
+        "write_batch_size": 1000,
+        "history_per_page": 500,
+        "rate_limit": {
+            "get_per_sec": 0.2,
+            "post_per_sec": 0.2,
+        },
+    },
+
+    "nuvio": {
+        "server_mode": "cloud",                         # "cloud" or "self_hosted"
+        "base_url": "https://api.nuvio.tv",
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "profile_id": "",
+        "profile_name": "",
+    },
+
+    "stremio": {
+        "auth_key": "",
+        "ratings": {
+            "liked_min": 6.0,                           # Numeric ratings from this value up to loved_min become Liked
+            "loved_min": 8.0,                           # Numeric ratings from this value up to 10 become Loved
+        },
+    },
+
+    "floppy": {
+        "server_url": "",                               # http(s)://host:8000
+        "api_token": "",                                # Floppy API token from Settings > Advanced
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+        "watchlist_name": "Watchlist",
+        "rate_limit": {
+            "get_per_sec": 20,
+            "post_per_sec": 20,
+        },
+    },
+
+    "scrob": {
+        "server_url": "",                               # http(s)://host:7330 (the URL you open Scrob with)
+        "api_key": "",                                  # Scrob API key from Connections > API Key
+        "username": "",                                 # Scrob account username (writes need a signed in session)
+        "password": "",                                 # Scrob account password
+        "api_prefix": "",                               # Detected on connect: "" direct backend, "/api/proxy" behind the Scrob frontend
+        "access_token": "",                             # Short lived Scrob JWT, re-issued from username/password
+        "expires_at": 0,                                # Unix seconds the access token expires at
+        "totp_enabled": False,                          # Scrob account uses 2FA, so the token cannot be renewed unattended
+        "reauth_required": False,                       # 2FA session expired; reads keep working, writes need a new code
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+        "watchlist_name": "Watchlist",                  # Scrob list used as the CrossWatch watchlist
+        "rate_limit": {
+            "get_per_sec": 10,
+            "post_per_sec": 5,
+        },
+    },
+
+    "playback_progress": {
+        "disabled_profiles": [],                        # Provider profiles excluded from Continue Watching, e.g. ["trakt:default"]
+        "provider_timeout_seconds": 20.0,               # Max time this screen waits for provider profiles during one refresh
+    },
+    
+     "tautulli": {
+         "server_url": "",                              # http(s)://host:8181
+         "api_key": "",                                 # Tautulli API key
+         "verify_ssl": False,                           # Verify TLS certificates
+         "timeout": 10.0,                               # HTTP timeout (seconds)
+         "max_retries": 3,                              # Retry budget
+         "history": {
+             "user_id": "",                             # Optional user filter
+             "per_page": 100,                           # Tautulli history page size
+             "watched_only": True,                      # Skip partial playback sessions (Tautulli logs every play)
+             "min_percent": 90                          # Completion fallback when watched_status is absent
+         },
+     },
+
+    "tracearr": {
+        "server_url": "",                               # http(s)://host:3000
+        "api_key": "",                                  # Tracearr public API key (trr_pub_...)
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 10.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget
+        "history": {
+            "user_id": "",                              # Optional Tracearr user id filter
+            "server_id": "",                            # Optional Tracearr server id filter
+            "per_page": 100,                            # Tracearr history page size (max 100)
+            "watched_only": True,                       # Skip partial plays (uses the Tracearr watched flag)
+            "min_percent_movie": 85,                    # Completion fallback when the watched flag is absent
+            "min_percent_episode": 85                   # Completion fallback when the watched flag is absent
+        },
+    },
+
+    "trakt": {
+        "client_id": "",                                # From your Trakt app
+        "client_secret": "",                            # From your Trakt app
+        "auth_method": "",
+        "access_token": "",                             # OAuth2 access token
+        "refresh_token": "",                            # OAuth2 refresh token
+        "scope": "public",                              # OAuth2 scope (usually "public" or "private")
+        "token_type": "Bearer",                         # OAuth2 token type (usually "Bearer")
+        "expires_at": 0,                                # Epoch when access_token expires
+
+        "timeout": 10,                                  # HTTP timeout (seconds)
+        "max_retries": 5,                               # Retry budget for API calls (429/5xx backoff)
+
+        # Rate limits
+        "rate_limit": {
+            "get_per_sec": 1.66,
+            "post_per_sec": 1,
+        },
+
+        # Watchlist
+        "watchlist_use_etag": True,                     # Use ETag + local shadow to skip unchanged lists
+        "watchlist_shadow_ttl_hours": 168,              # Refresh ETag baseline weekly even if 304s keep coming
+        "watchlist_batch_size": 100,                    # Chunk size for add/remove to avoid 429/rate spikes
+        "watchlist_log_rate_limits": True,              # Log X-RateLimit-* and Retry-After when present
+
+        # Ratings
+        "ratings_per_page": 250,                        # Items per page when indexing (10–250; clamped to 250)
+        "ratings_chunk_size": 100,                      # Batch size for POST/REMOVE
+
+        # History
+        "history_per_page": 250,
+        "history_chunk_size": 100,                      # Batch size for history add/remove writes
+
+        "_pending_device": {
+            "user_code": "",                            # Temporary device code state for PIN login
+            "device_code": "",                          # Temporary device code state for PIN login
+            "verification_url": "https://auth.trakt.tv/activate",
+            "interval": 5,                              # Polling interval (seconds)
+            "expires_at": 0,                            # Epoch when device_code expires
+            "created_at": 0,                            # Epoch when device_code was created
+        },
+    },
+"tmdb_sync": {                                          # Tracker / sync adapter auth (TMDb v3)
+    "api_key": "",                                      # v3 API Key (required)
+    "session_id": "",                                   # v3 Session ID (filled after Connect)
+    "account_id": "",                                   # v3 Account ID (auto-filled)
+    "read_token": "",                                   # v4 API Read Access Token (needed for lists)
+    "access_token": "",                                 # v4 user access token (filled after Connect)
+    "account_object_id": "",                            # v4 Account ID (auto-filled)
+    "v4_session_ref": "",                               # Ties the v4 token to the session it was created with
+    "_pending_request_token": "",                       # Temporary token waiting for approval
+    "_pending_v4": False,                               # Pending token came from the v4 flow
+    "_pending_created_at": 0,                           # Epoch when request token was created
+    "timeout": 15.0,
+    "max_retries": 3,
+},
+    "jellyfin": {
+        "server": "",                                   # http(s)://host:port (required)
+        "access_token": "",                             # Jellyfin access token (required)
+        "user_id": "",                                  # Jellyfin userId (required)
+        "device_id": "crosswatch",                      # Client device id
+        "username": "",                                 # Optional (login username)
+        "user": "",                                     # Optional (display name; hydrated after auth)
+        "auth_method": "",                              # "quick_connect" | "password" (metadata; runtime uses access_token)
+        "server_version": "",                           # Detected during authentication; Jellyfin 10.9+ required
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 15.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget for API calls
+        "targeted_lookup": True,                        # Cache movie/series IDs; fetch matched series episodes. False indexes all episodes.
+
+        "scrobble": {
+            "libraries": []                             # whitelist of library GUIDs; empty = all
+        },
+
+        # Watchlist settings
+        "watchlist": {
+            "mode": "favorites",                        # "favorites" | "playlist" | "collections"
+            "playlist_name": "Watchlist",               # used when mode == "playlist"
+            "watchlist_query_limit": 25,                # batch size
+            "watchlist_write_delay_ms": 0,              # delay between writes
+            "watchlist_guid_priority": [                # id match order
+                "tmdb", "imdb", "tvdb",
+                "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
+            ]
+        },
+
+        # History settings
+        "history": {
+            "history_query_limit": 25,                  # batch size
+            "history_write_delay_ms": 0,                # delay between writes
+            "history_guid_priority": [                  # id match order
+                "tmdb", "imdb", "tvdb",
+                "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
+            ],
+            "libraries": []                             # whitelist of library GUIDs (from /api/jellyfin/libraries.key); empty = all
+        },
+
+        "progress": {
+            "libraries": [],                            # whitelist for resumable items; empty = all
+        },
+
+        # Ratings settings
+        "ratings": {
+            "ratings_query_limit": 2000,                # ratings query limit, default 2000
+            "libraries": []                             # whitelist of library GUIDs; empty = all
+        },
+    },
+
+    "emby": {
+        "server": "",                                   # http(s)://host:port (required)
+        "access_token": "",                             # Emby access token (required)
+        "user_id": "",                                  # Emby userId (required)
+        "device_id": "crosswatch",                      # Client device id
+        "username": "",                                 # Optional (login username)
+        "user": "",                                     # Optional (display name; hydrated after auth)
+        "verify_ssl": False,                            # Verify TLS certificates
+        "timeout": 15.0,                                # HTTP timeout (seconds)
+        "max_retries": 3,                               # Retry budget for API calls
+
+        "scrobble": {
+            "libraries": []                             # whitelist of library GUIDs; empty = all
+        },
+
+        # Watchlist settings
+        "watchlist": {
+            "mode": "favorites",                        # "favorites" | "playlist" | "collections"
+            "playlist_name": "Watchlist",               # used when mode == "playlist"
+            "watchlist_query_limit": 25,                # batch size
+            "watchlist_write_delay_ms": 0,              # delay between writes
+            "watchlist_guid_priority": [                # id match order
+                "tmdb", "imdb", "tvdb",
+                "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
+            ]
+        },
+
+        # History settings
+        "history": {
+            "history_query_limit": 25,                  # batch size
+            "history_write_delay_ms": 0,                # delay between writes
+            "history_guid_priority": [                  # id match order
+                "tmdb", "imdb", "tvdb",
+                "agent:themoviedb:en", "agent:themoviedb", "agent:imdb"
+            ],
+            "libraries": []                             # whitelist of library GUIDs (from /api/emby/libraries.key); empty = all
+        },
+
+        "progress": {
+            "libraries": [],                            # whitelist for resumable items; empty = all
+        },
+
+        # Ratings settings
+        "ratings": {
+            "ratings_query_limit": 2000,                # ratings query limit, default 2000
+            "libraries": []                             # whitelist of library GUIDs; empty = all
+        },
+    },
+
+    "silo": {
+        "server_url": "",
+        "verify_ssl": False,
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "profile_id": "",
+        "profile_name": "",
+    },
+
+    "tofa": {
+        "server_url": "",
+        "verify_ssl": False,
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "profile_id": "",
+        "profile_name": "",
+    },
+
+    "kodi": {
+        "server": "",                                   # http(s)://host:port (required)
+        "username": "",                                 # Optional HTTP Basic Auth username
+        "password": "",                                 # Optional HTTP Basic Auth password
+        "verify_ssl": False,                            # Verify TLS certificates
+        "auth_method": "",                              # "basic" | "none" after connection verification
+        "kodi_version": "",                             # Detected during authentication; Kodi 21.0+ required
+        "jsonrpc_version": "",                          # Detected JSON-RPC version; 13.5.0+ required
+        "connection_verified": False,                   # True after JSON-RPC verification succeeds
+        "timeout": 12.0,                                # HTTP timeout (seconds)
+    },
+
+    "crosswatch": {
+        "connected":        True,                       # Fresh installs enable the local tracker by default
+        "root_dir":         "/config/.cw_provider",     # Root folder for local provider state
+        "enabled":          True,                       # Enable/disable CrossWatch as sync provider
+        "retention_days":   30,                         # Snapshot retention in days; 0 = keep forever
+        "auto_snapshot":    True,                       # Take snapshot before mutating main JSONs
+        "max_snapshots":    14,                         # Max snapshots per feature; 0 = unlimited
+        "restore_watchlist": "latest",                  # "", "latest", or specific snapshot name/stem
+        "restore_history": "latest",                    # "", "latest", or specific snapshot name/stem
+        "restore_ratings": "latest"                     # "", "latest", or specific snapshot name/stem
+    },
+    
+    # --- Meta Providers ------------------------------------------------------
+    
+    "tmdb": {"api_key": ""},                            # Metadata resolver (TMDb)
+    "fanart": {"enabled": False, "api_key": "", "personal_api_key": "", "logos": "fanart", "backgrounds": "fanart"},  # Artwork (fanart.tv)
+
+    # --- Sync / Orchestrator -------------------------------------------------
+    "sync": {
+        # Global write gates (pair/feature settings will override these by design):
+        "enable_add": True,                             # Allow additions by default
+        "enable_remove": False,                         # Safer default: do not remove items unless explicitly enabled
+        "one_way_remove_mode": "source_deletes",        # "source_deletes" | "mirror" (mirror = destructive; use with care)
+
+
+        # Execution behavior:
+        "verify_after_write": False,                    # When supported, re-check destination after writes
+        "dry_run": False,                               # Plan and log only; do not perform writes
+        "write_state_json": True,                       # Write sync state baselines/stats; leave on true
+        "drop_guard": False,                            # Guard against sudden inventory shrink (protects from bad/suspect snapshots)
+        "allow_mass_delete": True,                      # If False, block large delete plans (e.g., >~10% of baseline)
+        "tombstone_ttl_days": 1,                        # How long “observed deletes” (tombstones) stay valid
+        "include_observed_deletes": True,               # If False, skip processing “observed deletes” for this run. Delta-trackers (SIMKL) will be turned off to prevent accidental removals
+
+        # Optional high-level two-way defaults (pairs always remain the source of truth for mode):
+        "bidirectional": {
+            "enabled": False,
+            "mode": "two-way",                          # Placeholder default; pairs decide final mode per connection
+            "source_of_truth": "",                      # Optional: pick one side as tie-breaker if you enforce strict authority
+        },
+
+        # Blackbox (including flapper protection)
+        "blackbox": {
+            "enabled": True,                            # Turn off to fully disable blackbox logic
+            "promote_after": 3,                         # Promote an item to blackbox after N consecutive failed writes
+            "pair_scoped": True,                        # Track per source-target pair to avoid blocking the same title elsewhere
+            "cooldown_days": 30,                        # Auto-prune/decay blackbox entries after this cooldown period
+            "block_adds": True,                         # When blackboxed, block planned ADDs for that item
+            "block_removes": True,                      # When blackboxed, block planned REMOVEs for that item
+        },
+    },
+
+    # --- Runtime / Diagnostics ----------------------------------------------
+    "runtime": {
+        "debug": False,                                 # Extra verbose logging (debug level)
+        "debug_http": False,                            # Extra verbose HTTP logging (uvicorn access log)
+        "debug_mods": False,                            # Extra verbode MODS logging for Synchronization Providers
+        "state_dir": "",                                # Optional override for state dir (defaults to CONFIG/state)  - this will break container setups!
+        "telemetry": {"enabled": True},                 # Usage stats
+        "max_profiles_per_provider": 10,                # Total profiles per provider incl. default (1-100)
+        "max_sync_users_per_connection": 25,            # Synced media server users per connection (1-100)
+        "history_timestamp_tolerance_seconds": 60,      # Same-viewing history match window; 0 requires exact timestamps
+
+        # progress
+        "snapshot_ttl_sec": 300,                        # Reuse snapshots within 5 min
+        "apply_chunk_size": 100,                        # Sweet spot for apply chunking
+        "apply_chunk_pause_ms": 50,                     # Small pause between chunks
+        "apply_chunk_size_by_provider": {               # Provider-specific apply chunk overrides
+            "SIMKL": 500,
+            "WETRAKR": 500,
+            "MDBLIST": 500,
+            "PUBLICMETADB": 500,
+            "FLICKLIST": 1000,
+            "PLEX": 500,
+            "JELLYFIN": 500,
+            "EMBY": 500,
+            "FLOPPY": 500,
+            "SCROB": 500,
+            "STREMIO": 500,
+            "NUVIO": 500,
+            "KODI": 500
+        },
+        
+        # suspect guard (shrinking inventories protection)
+        "suspect_min_prev": 20,                         # Minimum previous size to enable suspect guard
+        "suspect_shrink_ratio": 0.10,                   # Shrink ratio to trigger suspect guard
+    },
+
+    # --- Metadata (TMDb resolver) -------------------------------------------
+    "metadata": {
+        "locale": "en-US",                              # example: "en-US" / "nl-NL"
+    },
+
+    # --- Anime ID Mapping ----------------------------------------------------
+    "anime_mapping": {
+        "enabled": False,                               # Enable local anime ID enrichment for anime-native providers
+        "auto_update": True,                            # Refresh the local AniBridge dataset in the background when enabled
+        "provider": "anibridge",                        # Local dataset provider
+        "release_tag": "v3",                            # AniBridge release tag
+        "refresh_hours": 24,                            # Minimum age before an automatic refresh is considered
+        "stale_after_days": 14,                         # UI/status warning threshold
+        "use_for_pairs": ["anilist", "myanimelist", "kitsu", "simkl", "crosswatch"],  # Providers that activate anime mapping when present in a pair ("*" = any pair)
+        "features": ["watchlist", "ratings", "history"],  # Sync features where anime mapping may apply; history is opt-in per pair
+    },
+
+    "assistant": {
+        "enabled": False,
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "wiki_help": True,
+    },
+
+    # --- Scrobble ------------------------------------------------------------
+    "scrobble": {
+        "enabled": False,                               # Master toggle
+        "mode": "watch",                                # Legacy fallback: "watch" | "webhook"; new saves use scrobble.sources for independent toggles
+        "delete_plex": False,                           # Old name but still valid. Auto-remove movies from all your Watchlists, for all media servers
+        "delete_plex_types": ["movie"],                 # Old name but still valid. Movie/show/episode
+
+        # Watcher settings
+        "watch": {
+            "autostart": False,                         # Start watcher on boot if the watcher source is enabled
+            "routes": [],                               # Route-based config
+            "plex_simkl_ratings": False,                # Watch mode: forward Plex ratings to SIMKL
+            "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
+            "plex_wetrakr_ratings": False,
+            "plex_anilist_ratings": False,
+            "plex_kitsu_ratings": False,
+            "plex_myanimelist_ratings": False,
+            "plex_mdblist_ratings": False,              # Watch mode: forward Plex ratings to MDblist
+            "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
+            "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
+            "plex_silo_ratings": False,
+            "pause_debounce_seconds": 5,                # Ignore micro-pauses just after start
+            "suppress_start_at": 99,                    # Kill near-end "start" flaps (credits)
+            "filters": {
+                "username_whitelist": [],               # ["name", "id:123", "uuid:abcd…"]
+                "server_uuid": "",                      # Legacy single-server allow filter
+                "server_uuid_whitelist": [],            # Accept only these Plex server UUIDs (empty = allow all unless blacklisted)
+                "server_uuid_blacklist": []             # Always ignore these Plex server UUIDs
+            }
+        },
+
+        # Webhook settings
+        "webhook": {
+            "pause_debounce_seconds": 5,                # Ignore micro-pauses
+            "suppress_start_at": 99,                    # Suppress near-end "start" flaps (credits)
+            "suppress_autoplay_seconds": 15,            # Plex autoplay when set on 10 sec (increase a few sec)
+            "probe_session_progress": True,             # Call GET /status/sessions on your Plex server and match the item by ratingKey/sessionKey
+            "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
+            "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
+            "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
+            "plex_silo_ratings": False,
+            # Plex-only filters
+            "filters_plex": {
+                "username_whitelist": [],               # Restrict accepted Account.title values (empty = allow all)
+                "server_uuid": "",                      # Legacy single-server allow filter
+                "server_uuid_whitelist": [],            # Accept only these Plex server UUIDs (empty = allow all unless blacklisted)
+                "server_uuid_blacklist": []             # Always ignore these Plex server UUIDs
+            }
+        },
+
+        # Scrobble progress policy shared by Trakt, SIMKL, and MDBList
+        "trakt": {
+            "progress_step": 25,                        # Coalesce start/progress updates in % steps
+            "watched_at": 90,                           # Watched threshold for local completion/statistics/watchlist removal
+            "force_stop_at": 95,                        # Defensive final-stop trust threshold
+            "regress_tolerance_percent": 5,             # Small progress regress is tolerated
+        }
+    },
+
+    # --- Scheduling ----------------------------------------------------------
+    "scheduling": {
+        "enabled": False,                               # Standard scheduler master toggle
+        "mode": "every_n_hours",                        # "hourly" | "every_n_hours" | "daily_time" | "custom_interval"
+        "every_n_hours": 12,                            # When mode=every_n_hours, run every N hours (2+ recommended)
+        "daily_time": "03:30",                          # When mode=daily_time, run at this time (HH:MM, 24h)
+        "custom_interval_minutes": 60,                  # When mode=custom_interval, run every N minutes (minimum 15)
+        "jitter_seconds": 300,                          # Random delay added to each scheduled run so installs do not all fire at once
+        "webhooks": dict(DEFAULT_SCHEDULER_WEBHOOKS),    # Optional outbound scheduler lifecycle callbacks
+        "advanced": {
+            "enabled": False,                           # Advanced scheduler master toggle
+            "jobs": [],
+        },
+    },
+
+    # --- User Interface ------------------------------------------------------
+    "ui": {
+        "theme": "flat-dark",                           # "flat-dark" | "flat-light" | "original"
+        "show_watchlist_preview": True,                 # Show Watchlist Preview card on Main tab
+        "show_playingcard": True,                       # Show Now Playing card on Main tab
+        "show_recent_activity": True,                   # Show Recent Scrobble card on Main tab
+        "show_recent_history_widget": True,             # Show Recent History widget on Main tab
+        "show_latest_ratings_widget": True,             # Show Latest Ratings widget on Main tab
+        "show_recent_scrobble_widget": True,            # Show Recent Scrobble widget on Main tab
+        "show_recent_progress_widget": False,           # Show Recent Progress widget on Main tab
+        "show_recent_playlists_widget": False,          # Show Recent Playlists widget on Main tab
+        "recent_activity_display": "count:3",           # "count:3|4|5" | "hours:24|48|72"
+        "recent_activity_limit": 3,                     # Recent Scrobble rows on Main tab
+        "recent_syncs_display": "count:3",              # "count:3|4|5" | "hours:24|48|72"
+        "recent_syncs_limit": 3,                        # Recent Sync rows on Main tab
+        "show_quick_add_desktop": True,                 # Show the Main-tab quick add drawer on desktop
+        "show_quick_add_mobile": True,                  # Show the Main-tab quick add floating button on mobile
+        "protocol": "http",                             # "http" | "https" (HTTPS uses a self-signed cert by default)
+        "tls": {
+            "self_signed": True,                        # Auto-generate a self-signed certificate when missing
+            "hostname": "localhost",                    # Used for certificate CN/SAN
+            "valid_days": 825,                          # Certificate validity (days)
+            "cert_file": "",                            # Optional override path to a PEM cert
+            "key_file": "",                             # Optional override path to a PEM key
+        },
+    },
+
+    # --- Local UI Authentication --------------------------------------------
+    "app_auth": {
+        "enabled": False,
+        "username": "",
+        "reset_required": False,
+        "remember_session_enabled": False,
+        "remember_session_days": 30,
+        "password": {
+            "scheme": "pbkdf2_sha256",
+            "iterations": 260000,
+            "salt": "",
+            "hash": "",
+        },
+        "session": {
+            "token_hash": "",
+            "expires_at": 0,
+        },
+        "sessions": [],
+        "api_tokens": [],
+        "last_login_at": 0,
+        "users": {},
+    },
+
+    # --- Pairs (UI-driven) ---------------------------------------------------
+    "pairs": [],
+}
+
+
+def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = copy.deepcopy(cfg or {})
+    MASK = "••••••••"
+
+    # Provider-specific secret fields
+    provider_secret_keys: dict[str, set[str]] = {
+        "plex": {"account_token", "pms_token", "home_pin", "webhook_secret"},
+        "simkl": {"access_token", "refresh_token", "client_secret", "_pending_pin"},
+        "anilist": {"access_token", "client_secret"},
+        "kitsu": {"access_token", "refresh_token", "password"},
+        "mdblist": {"api_key", "access_token", "refresh_token", "_pending_device"},
+        "publicmetadb": {"api_key"},
+        "myanimelist": {"access_token", "refresh_token"},
+        "wetrakr": {"access_token", "refresh_token"},
+        "punchplay": {"access_token", "refresh_token", "_pending_device"},
+        "bingebase": {"access_token", "webhook_url", "api_key", "_pending_device"},
+        "flicklist": {"api_key", "access_token", "token", "_pending_device"},
+        "nuvio": {"access_token", "refresh_token", "_pending_tv_login", "_pending_tv_caller"},
+        "stremio": {"auth_key", "authKey"},
+        "floppy": {"api_token"},
+        "scrob": {"api_key", "password", "access_token"},
+        "tautulli": {"api_key"},
+        "tracearr": {"api_key"},
+        "trakt": {"access_token", "refresh_token", "client_secret"},
+        "jellyfin": {"access_token", "api_key", "password"},
+        "emby": {"access_token", "api_key", "password"},
+        "silo": {"access_token", "refresh_token", "profile_token", "_pending_device"},
+        "tofa": {"access_token", "refresh_token", "profile_token", "sync_key_token", "_pending_device"},
+        "kodi": {"password"},
+        "tmdb": {"api_key"},
+        "fanart": {"api_key", "personal_api_key"},
+        "tmdb_sync": {"api_key", "session_id", "_pending_request_token", "read_token", "access_token", "_pending_access_token"},
+        "assistant": {"api_key"},
+    }
+
+    def _mask_leaf(d: dict[str, Any], key: str) -> None:
+        v = d.get(key)
+        if v is None:
+            return
+        s = str(v).strip()
+        if not s or s == MASK:
+            return
+        d[key] = MASK
+
+    for provider, keys in provider_secret_keys.items():
+        blk = out.get(provider)
+        if not isinstance(blk, dict):
+            continue
+
+        for k in keys:
+            _mask_leaf(blk, k)
+
+        insts = blk.get("instances")
+        parents = [blk, *(inst for inst in (insts.values() if isinstance(insts, dict) else []) if isinstance(inst, dict))]
+        for parent in parents:
+            if parent is not blk:
+                for k in keys:
+                    _mask_leaf(parent, k)
+            users = parent.get("sync_users")
+            if isinstance(users, dict):
+                for entry in users.values():
+                    if isinstance(entry, dict):
+                        for k in keys:
+                            _mask_leaf(entry, k)
+
+    # App UI auth secrets.
+    a = out.get("app_auth")
+    if isinstance(a, dict):
+        pwd = a.get("password")
+        if isinstance(pwd, dict):
+            if pwd.get("hash"):
+                pwd["hash"] = MASK
+            if pwd.get("salt"):
+                pwd["salt"] = MASK
+
+        sess = a.get("session")
+        if isinstance(sess, dict) and sess.get("token_hash"):
+            sess["token_hash"] = MASK
+
+        sessions = a.get("sessions")
+        if isinstance(sessions, list):
+            for s in sessions:
+                if isinstance(s, dict) and s.get("token_hash"):
+                    s["token_hash"] = MASK
+
+        api_tokens = a.get("api_tokens")
+        if isinstance(api_tokens, list):
+            for t in api_tokens:
+                if isinstance(t, dict) and t.get("token_hash"):
+                    t["token_hash"] = MASK
+                if isinstance(t, dict) and t.get("token_digest"):
+                    t["token_digest"] = MASK
+                if isinstance(t, dict) and t.get("secret"):
+                    t["secret"] = MASK
+
+        totp = a.get("totp")
+        if isinstance(totp, dict):
+            _mask_leaf(totp, "secret")
+            _mask_leaf(totp, "pending_secret")
+
+        users = a.get("users")
+        if isinstance(users, dict):
+            for raw_user in users.values():
+                if not isinstance(raw_user, dict):
+                    continue
+                utotp = raw_user.get("totp")
+                if isinstance(utotp, dict):
+                    _mask_leaf(utotp, "secret")
+                    _mask_leaf(utotp, "pending_secret")
+
+    # Webhook URL tokens
+    sec = out.get("security")
+    if isinstance(sec, dict):
+        wh = sec.get("webhook_ids")
+        if isinstance(wh, dict):
+            for k in list(wh.keys()):
+                _mask_leaf(wh, k)
+
+    scheduling = out.get("scheduling")
+    if isinstance(scheduling, dict):
+        hooks = scheduling.get("webhooks")
+        if isinstance(hooks, dict):
+            for key in ("url", "default_url", "base_url", "healthchecks_base_url", "start_url", "success_url", "failure_url", "pushover_token", "pushover_user"):
+                _mask_leaf(hooks, key)
+
+    return out
+
+
+# Helpers: paths, IO, merging, normalization
+CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
+    "version",
+    "security",
+    "app_auth",
+    "user_profiles",
+    "provider_instance_ids",
+    "plex",
+    "jellyfin",
+    "emby",
+    "silo",
+    "tofa",
+    "kodi",
+    "tautulli",
+    "tracearr",
+    "trakt",
+    "simkl",
+    "mdblist",
+    "anilist",
+    "myanimelist",
+    "kitsu",
+    "tmdb_sync",
+    "publicmetadb",
+    "wetrakr",
+    "punchplay",
+    "bingebase",
+    "flicklist",
+    "nuvio",
+    "stremio",
+    "floppy",
+    "scrob",
+    "crosswatch",
+    "metadata",
+    "tmdb",
+    "fanart",
+    "anime_mapping",
+    "assistant",
+    "sync",
+    "pairs",
+    "scrobble",
+    "scheduling",
+    "playlists",
+    "playback_progress",
+    "runtime",
+    "features",
+    "ui",
+)
+
+OBSOLETE_CONFIG_KEYS: tuple[str, ...] = ("mobile_auth", "runtime.kodi_addon")
+
+
+def cleanup_obsolete_config_keys(cfg: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    for key in OBSOLETE_CONFIG_KEYS:
+        *parents, leaf = key.split(".")
+        node: Any = cfg
+        for part in parents:
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node:
+            node.pop(leaf, None)
+            changed.append(key)
+    for provider in ("trakt", "mdblist", "publicmetadb", "flicklist", "punchplay", "scrob", "tautulli", "tracearr"):
+        root = cfg.get(provider)
+        if not isinstance(root, dict):
+            continue
+        blocks = [(provider, root)]
+        instances = root.get("instances")
+        if isinstance(instances, dict):
+            blocks.extend((f"{provider}.instances.{name}", block) for name, block in instances.items() if isinstance(block, dict))
+        for path, block in blocks:
+            for key in ("history_max_pages", "ratings_max_pages", "collection_max_pages", "watchlist_max_pages", "progress_max_pages"):
+                if key in block:
+                    block.pop(key)
+                    changed.append(f"{path}.{key}")
+            history = block.get("history")
+            if provider in ("tautulli", "tracearr") and isinstance(history, dict) and "max_pages" in history:
+                history.pop("max_pages")
+                changed.append(f"{path}.history.max_pages")
+    return changed
+
+
+def _order_config_for_write(data: dict[str, Any]) -> dict[str, Any]:
+    ordered: dict[str, Any] = {}
+    for key in CONFIG_TOP_LEVEL_ORDER:
+        if key in data:
+            ordered[key] = data[key]
+    for key, value in data.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _cfg_file() -> Path:
+    return CONFIG / "config.json"
+
+
+def _ownership_reference(path: Path) -> os.stat_result | None:
+    path_stat: os.stat_result | None = None
+    parent_stat: os.stat_result | None = None
+    try:
+        if path.exists():
+            path_stat = path.stat()
+    except Exception:
+        path_stat = None
+    try:
+        if path.parent.exists():
+            parent_stat = path.parent.stat()
+    except Exception:
+        parent_stat = None
+    if os.name != "nt" and path_stat is not None and parent_stat is not None:
+        try:
+            if os.geteuid() == 0 and path_stat.st_uid == 0 and parent_stat.st_uid != 0:
+                return parent_stat
+        except Exception:
+            pass
+    return path_stat or parent_stat
+
+
+def _apply_owner_mode(path: Path, ref: os.stat_result | None, *, mode: int | None = None) -> None:
+    if ref is None:
+        return
+    if os.name != "nt":
+        try:
+            os.chown(path, ref.st_uid, ref.st_gid)
+        except Exception:
+            pass
+    try:
+        os.chmod(path, mode if mode is not None else stat.S_IMODE(ref.st_mode))
+    except Exception:
+        pass
+
+
+@contextmanager
+def _config_file_lock() -> Iterator[None]:
+    depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0) or 0)
+    if depth > 0:
+        _CONFIG_FILE_LOCK_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth = depth
+        return
+    lock_path = CONFIG / "config.json.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = lock_path.open("a+b")
+    except PermissionError:
+        _CONFIG_FILE_LOCK_STATE.depth = 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth = 0
+        return
+    _apply_owner_mode(lock_path, _ownership_reference(_cfg_file()), mode=0o660)
+    with f:
+        _CONFIG_FILE_LOCK_STATE.depth = 1
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            _CONFIG_FILE_LOCK_STATE.depth = 0
+
+
+@contextmanager
+def _config_io_lock() -> Iterator[None]:
+    with _CONFIG_LOCK:
+        with _config_file_lock():
+            yield
+
+
+def config_path() -> Path:
+    return _cfg_file()
+
+
+def backup_config_file() -> Path | None:
+    src = _cfg_file()
+    if not src.exists():
+        return None
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    dst = src.with_name(f"{src.name}.backup_{ts}")
+    i = 1
+    while dst.exists():
+        dst = src.with_name(f"{src.name}.backup_{ts}_{i}")
+        i += 1
+
+    import shutil
+
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _read_json(p: Path) -> dict[str, Any]:
+    with _config_io_lock():
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+def _write_json_atomic(p: Path, data: dict[str, Any]) -> None:
+    with _config_io_lock():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import os as _os, time as _time, secrets, threading
+
+        suffix = f".{_time.time_ns()}.{_os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+        tmp = p.with_suffix(suffix)
+        ref = _ownership_reference(p)
+        mode = stat.S_IMODE(ref.st_mode) if ref is not None and p.exists() else 0o600
+
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        _apply_owner_mode(tmp, ref, mode=mode)
+        tmp.replace(p)
+        _apply_owner_mode(p, ref, mode=mode)
+        if p == _cfg_file():
+            invalidate_config_cache()
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)  # type: ignore[assignment]
+        else:
+            out[k] = v
+
+    return out
+
+def _path_parts(path: str | Iterable[str]) -> list[str]:
+    if isinstance(path, str):
+        return [part.strip() for part in path.split(".") if str(part).strip()]
+    return [str(part).strip() for part in path if str(part).strip()]
+
+
+def _get_nested_value(src: dict[str, Any], path: str | Iterable[str]) -> tuple[bool, Any]:
+    parts = _path_parts(path)
+    if not parts:
+        return False, None
+
+    cur: Any = src
+    for part in parts:
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
+
+
+def _scheduler_webhook_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_scheduler_webhooks(value: Any) -> dict[str, Any]:
+    src = value if isinstance(value, dict) else {}
+    out = dict(DEFAULT_SCHEDULER_WEBHOOKS)
+    out["enabled"] = _scheduler_webhook_flag(src.get("enabled"))
+    out["alert_on_unresolved"] = _scheduler_webhook_flag(
+        src.get("alert_on_unresolved") if src.get("alert_on_unresolved") is not None else src.get("alertOnUnresolved")
+    )
+    out["alert_on_watcher"] = _scheduler_webhook_flag(
+        src.get("alert_on_watcher") if src.get("alert_on_watcher") is not None else src.get("alertOnWatcher")
+    )
+    out["alert_on_provider_auth"] = _scheduler_webhook_flag(
+        src.get("alert_on_provider_auth") if src.get("alert_on_provider_auth") is not None else src.get("alertOnProviderAuth")
+    )
+    out["url"] = _http_url_or_blank(src.get("url") or src.get("default_url"))
+    out["base_url"] = _http_url_or_blank(src.get("base_url") or src.get("healthchecks_base_url"))
+    for key in ("start_url", "success_url", "failure_url"):
+        out[key] = _http_url_or_blank(src.get(key))
+    out["payload_format"] = _scheduler_webhook_payload_format(src.get("payload_format") or src.get("format"))
+    out["notifiarr_channel_id"] = _digits_or_blank(src.get("notifiarr_channel_id") or src.get("notifiarrChannelId"))
+    out["pushover_token"] = _pushover_key_or_blank(src.get("pushover_token") or src.get("pushoverToken"))
+    out["pushover_user"] = _pushover_key_or_blank(src.get("pushover_user") or src.get("pushoverUser"))
+    try:
+        timeout = int(src.get("timeout_seconds", 10) or 10)
+    except Exception:
+        timeout = 10
+    out["timeout_seconds"] = max(1, min(60, timeout))
+    return out
+
+
+def _http_url_or_blank(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return ""
+    return url
+
+
+def _scheduler_webhook_payload_format(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"notifiarr", "notifiarr_passthrough"}:
+        return "notifiarr"
+    if text in {"pushover", "ntfy"}:
+        return text
+    return "crosswatch"
+
+
+def _digits_or_blank(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.isdigit() else ""
+
+
+def _pushover_key_or_blank(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if len(text) == 30 and text.isascii() and text.isalnum() else ""
+
+
+def _set_nested_value(dst: dict[str, Any], path: str | Iterable[str], value: Any) -> None:
+    parts = _path_parts(path)
+    if not parts:
+        return
+
+    cur: dict[str, Any] = dst
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = cast(dict[str, Any], nxt)
+
+    cur[parts[-1]] = copy.deepcopy(value)
+
+
+def apply_default_overrides(
+    cfg: dict[str, Any],
+    override_keys: Iterable[str],
+) -> tuple[dict[str, Any], list[str]]:
+    data = copy.deepcopy(dict(cfg or {}))
+    applied: list[str] = []
+
+    for key in override_keys:
+        parts = _path_parts(key)
+        if not parts:
+            continue
+
+        found, value = _get_nested_value(DEFAULT_CFG, parts)
+        if not found:
+            continue
+
+        dotted = ".".join(parts)
+        _set_nested_value(data, parts, value)
+        applied.append(dotted)
+
+    return data, applied
+
+def _normalize_tracker_snapshot_defaults(cfg: dict[str, Any]) -> None:
+    marker = "_snapshot_defaults_v2"
+    for key in ("crosswatch", "CrossWatch"):
+        base = cfg.get(key)
+        if not isinstance(base, dict):
+            continue
+        original_count = base.get("max_snapshots", 14 if base.get(marker) else 64)
+        original_days = base.get("retention_days", 30)
+        instances = base.get("instances")
+        blocks = [base, *(instances.values() if isinstance(instances, dict) else [])]
+        planned = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            count = block.get("max_snapshots", original_count)
+            days = block.get("retention_days", original_days)
+            if not block.get(marker) and str(count) == "64" and str(days) == "30":
+                count = 14
+            planned.append((block, count))
+        base_count = planned[0][1]
+        for block, count in planned:
+            if block is base or "max_snapshots" in block or str(count) != str(base_count):
+                block["max_snapshots"] = count
+            block[marker] = True
+
+
+def apply_migration_overrides(cfg: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    try:
+        from .config_overrides import MIGRATION_OVERRIDE_KEYS
+    except Exception:
+        MIGRATION_OVERRIDE_KEYS = ()
+
+    data, applied = apply_default_overrides(cfg, MIGRATION_OVERRIDE_KEYS)
+    _normalize_tracker_snapshot_defaults(data)
+    return data, applied
+
+
+# Feature normalization
+_ALLOWED_RATING_TYPES: list[str] = ["movies", "shows", "seasons", "episodes"]
+_ALLOWED_RATING_MODES: list[str] = ["only_new", "from_date", "all"]
+_ALLOWED_COLLECTION_TYPES: list[str] = ["movies", "shows", "seasons", "episodes"]
+_ALLOWED_UI_PROTOCOLS: list[str] = ["http", "https"]
+
+
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable):
+        return [str(x) for x in value if isinstance(x, (str, int, float))]
+    return []
+
+
+def _normalize_ratings_feature(val: dict[str, Any]) -> dict[str, Any]:
+    v: dict[str, Any] = dict(val or {})
+    v["enable"] = bool(v.get("enable", False))
+    v["add"] = bool(v.get("add", False))
+    v["remove"] = bool(v.get("remove", False))
+
+    # types
+    raw_types = _as_list(v.get("types"))
+    types = [str(t).strip().lower() for t in raw_types]
+    if "all" in types:
+        types = list(_ALLOWED_RATING_TYPES)
+    else:
+        types = [t for t in _ALLOWED_RATING_TYPES if t in types]
+        if not types:
+            types = ["movies", "shows"]
+    v["types"] = types
+
+    mode = str(v.get("mode", "only_new")).strip().lower()
+    if mode not in _ALLOWED_RATING_MODES:
+        mode = "only_new"
+    v["mode"] = mode
+
+    from_date = str(v.get("from_date", "") or "").strip()
+    if mode != "from_date":
+        from_date = ""
+    v["from_date"] = from_date
+
+    return v
+
+
+def _normalize_collection_feature(val: dict[str, Any]) -> dict[str, Any]:
+    v: dict[str, Any] = dict(val or {})
+    v["enable"] = bool(v.get("enable", False))
+    v["add"] = bool(v.get("add", False))
+    v["remove"] = bool(v.get("remove", False))
+    for flag in ("media_info", "media_updates"):
+        if flag in v:
+            v[flag] = bool(v.get(flag))
+
+    raw_types = _as_list(v.get("types"))
+    types = [str(t).strip().lower() for t in raw_types]
+    if "all" in types:
+        types = list(_ALLOWED_COLLECTION_TYPES)
+    else:
+        types = [t for t in _ALLOWED_COLLECTION_TYPES if t in types]
+        if not types:
+            types = ["movies"]
+    v["types"] = types
+
+    return v
+
+
+def _normalize_remove_mode(raw: Any) -> str | None:
+    mode = str(raw or "").strip().lower()
+    if not mode:
+        return None
+    return "mirror" if mode == "mirror" else "source_deletes"
+
+
+def _normalize_features_map(features: dict[str, Any] | None) -> dict[str, Any]:
+    f: dict[str, Any] = dict(features or {})
+    for name, val in list(f.items()):
+        if isinstance(val, dict):
+            v: dict[str, Any] = dict(val)
+            v.setdefault("enable", True)
+            v.setdefault("add", True)
+            v.setdefault("remove", False)
+            if "remove_mode" in v:
+                remove_mode = _normalize_remove_mode(v.get("remove_mode"))
+                if remove_mode is None:
+                    v.pop("remove_mode", None)
+                else:
+                    v["remove_mode"] = remove_mode
+
+            # Ratings has extra fields
+            if name == "ratings":
+                v = _normalize_ratings_feature(v)
+            elif name == "collection":
+                v = _normalize_collection_feature(v)
+            f[name] = v
+            continue
+
+        # Unknown
+        f[name] = {"enable": False, "add": False, "remove": False}
+    return f
+
+
+def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    v = parent.get(key)
+    if isinstance(v, dict):
+        return cast(dict[str, Any], v)
+    d: dict[str, Any] = {}
+    parent[key] = d
+    return d
+
+
+def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
+    t0 = cfg.get("tmdb_sync")
+    if isinstance(t0, dict):
+        t = t0
+    else:
+        t = {}
+        cfg["tmdb_sync"] = t
+
+    # TMDb sync v3 config
+    t["api_key"] = str(t.get("api_key") or "").strip()
+    t["session_id"] = str(t.get("session_id") or "").strip()
+    t["account_id"] = str(t.get("account_id") or "").strip()
+    t["read_token"] = str(t.get("read_token") or "").strip()
+    t["access_token"] = str(t.get("access_token") or "").strip()
+    t["account_object_id"] = str(t.get("account_object_id") or "").strip()
+    t["v4_session_ref"] = str(t.get("v4_session_ref") or "").strip()
+    t["_pending_request_token"] = str(t.get("_pending_request_token") or "").strip()
+    t["_pending_v4"] = bool(t.get("_pending_v4"))
+    try:
+        t["_pending_created_at"] = int(t.get("_pending_created_at") or 0)
+    except Exception:
+        t["_pending_created_at"] = 0
+
+    try:
+        t["timeout"] = float(t.get("timeout", 15.0) or 15.0)
+    except Exception:
+        t["timeout"] = 15.0
+    try:
+        t["max_retries"] = int(t.get("max_retries", 3) or 3)
+    except Exception:
+        t["max_retries"] = 3
+
+    # Guard: if api_key is empty, clear derived/session state
+    if not t["api_key"]:
+        t["session_id"] = ""
+        t["account_id"] = ""
+        t["access_token"] = ""
+        t["account_object_id"] = ""
+        t["v4_session_ref"] = ""
+        t["_pending_request_token"] = ""
+        t["_pending_v4"] = False
+        t["_pending_created_at"] = 0
+
+
+def _normalize_trakt(cfg: dict[str, Any]) -> None:
+    t0 = cfg.get("trakt")
+    if isinstance(t0, dict):
+        t = t0
+    else:
+        t = {}
+        cfg["trakt"] = t
+
+    rl0 = t.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        t["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    # Allow 0 to disable throttling.
+    post_rps = _rate("post_per_sec", 1.0)
+    get_rps = _rate("get_per_sec", 1.66)
+    if get_rps == 3.33:
+        get_rps = 1.66
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
+
+def _normalize_simkl(cfg: dict[str, Any]) -> None:
+    s0 = cfg.get("simkl")
+    if isinstance(s0, dict):
+        s = s0
+    else:
+        s = {}
+        cfg["simkl"] = s
+
+    rl0 = s.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        s["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    # Allow 0 to disable throttling.
+    post_rps = _rate("post_per_sec", 1.0)
+    get_rps = _rate("get_per_sec", 10.0)
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
+
+def _normalize_mdblist(cfg: dict[str, Any]) -> None:
+    m0 = cfg.get("mdblist")
+    if isinstance(m0, dict):
+        m = m0
+    else:
+        m = {}
+        cfg["mdblist"] = m
+
+    def _norm_method(block: dict[str, Any]) -> str:
+        has_api = bool(str(block.get("api_key") or block.get("key") or "").strip())
+        has_oauth = bool(str(block.get("access_token") or "").strip() or str(block.get("refresh_token") or "").strip())
+        has_pending_device = isinstance(block.get("_pending_device"), dict)
+        if has_api and not has_oauth:
+            if has_pending_device:
+                return "device_code"
+            return "api_key"
+        if has_oauth or has_pending_device:
+            return "device_code"
+        raw = str(block.get("auth_method") or "").strip().lower().replace("-", "_")
+        if raw in ("api", "apikey", "api_key", "key"):
+            return "api_key"
+        if raw in ("device", "device_code", "oauth", "oauth_device", "bearer"):
+            return "device_code"
+        return "device_code"
+
+    def _normalize_auth_block(block: dict[str, Any]) -> None:
+        method = _norm_method(block)
+        has_api_before = bool(str(block.get("api_key") or block.get("key") or "").strip())
+        has_oauth_before = bool(str(block.get("access_token") or "").strip() or str(block.get("refresh_token") or "").strip())
+        # Do not let a passive UI/config save destroy an existing API key just
+        # because the default method is Device Code. The API key becomes
+        # inactive once Device Code has real token state, and is cleared after
+        # MDBList returns tokens. A pending device flow is an explicit switch
+        # in progress, so keep it selected while the user approves the login.
+        has_pending_before = isinstance(block.get("_pending_device"), dict)
+        if method == "device_code" and has_api_before and not has_oauth_before and not has_pending_before:
+            method = "api_key"
+        block["auth_method"] = method
+        block["client_id"] = str(block.get("client_id") or "").strip()
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        block["refresh_token"] = str(block.get("refresh_token") or "").strip()
+        block["token_type"] = str(block.get("token_type") or "Bearer").strip() or "Bearer"
+        block["scope"] = str(block.get("scope") or "write").strip() or "write"
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        block["api_key"] = str(block.get("api_key") or block.get("key") or "").strip()
+        if method == "api_key":
+            block["access_token"] = ""
+            block["refresh_token"] = ""
+            block["expires_at"] = 0
+        else:
+            block["api_key"] = ""
+        pend = block.get("_pending_device")
+        if isinstance(pend, dict):
+            pend["device_code"] = str(pend.get("device_code") or "").strip()
+            pend["user_code"] = str(pend.get("user_code") or "").strip()
+            pend["verification_uri"] = str(pend.get("verification_uri") or pend.get("verification_url") or "https://mdblist.com/oauth/device/").strip()
+            try:
+                pend["interval"] = int(pend.get("interval") or 5)
+            except Exception:
+                pend["interval"] = 5
+            try:
+                pend["expires_at"] = int(pend.get("expires_at") or 0)
+            except Exception:
+                pend["expires_at"] = 0
+            try:
+                pend["created_at"] = int(pend.get("created_at") or 0)
+            except Exception:
+                pend["created_at"] = 0
+
+    _normalize_auth_block(m)
+    insts = m.get("instances")
+    if isinstance(insts, dict):
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _normalize_auth_block(inst)
+
+    rl0 = m.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        m["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float = 1000.0) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    # Allow 0 to disable throttling.
+    post_rps = _rate("post_per_sec", 1.0)
+    get_rps = _rate("get_per_sec", 10.0)
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
+
+def _normalize_publicmetadb(cfg: dict[str, Any]) -> None:
+    p0 = cfg.get("publicmetadb")
+    if isinstance(p0, dict):
+        p = p0
+    else:
+        p = {}
+        cfg["publicmetadb"] = p
+    p["base_url"] = str(p.get("base_url") or "https://publicmetadb.com").strip().rstrip("/")
+    p["watchlist_name"] = str(p.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+    p["watchlist_auto_create"] = bool(p.get("watchlist_auto_create", True))
+
+    def _int_range(name: str, default: int, lo: int, hi: int) -> None:
+        try:
+            n = int(p.get(name, default) or default)
+        except Exception:
+            n = default
+        p[name] = max(lo, min(n, hi))
+
+    _int_range("watchlist_page_size", 500, 1, 500)
+    _int_range("history_per_page", 500, 1, 500)
+    _int_range("progress_per_page", 500, 1, 500)
+    _int_range("ratings_submit_per_hour", 200, 1, 200)
+    _int_range("ratings_update_per_hour", 100, 1, 100)
+    p["ratings_label"] = str(p.get("ratings_label") or "Overall").strip() or "Overall"
+
+    rl0 = p.get("rate_limit")
+    if isinstance(rl0, dict):
+        rl = rl0
+    else:
+        rl = {}
+        p["rate_limit"] = rl
+
+    def _rate(name: str, default: float, *, max_v: float) -> float:
+        v = rl.get(name, default)
+        try:
+            f = float(v)
+        except Exception:
+            f = float(default)
+        if f < 0:
+            f = 0.0
+        if f > max_v:
+            f = max_v
+        return f
+
+    post_rps = _rate("post_per_sec", 3.0, max_v=3.0)
+    get_rps = _rate("get_per_sec", 20.0, max_v=20.0)
+    rl["post_per_sec"] = int(post_rps) if float(post_rps).is_integer() else float(post_rps)
+    rl["get_per_sec"] = int(get_rps) if float(get_rps).is_integer() else float(get_rps)
+
+
+def _normalize_nuvio(cfg: dict[str, Any]) -> None:
+    n0 = cfg.get("nuvio")
+    if isinstance(n0, dict):
+        n = n0
+    else:
+        n = {}
+        cfg["nuvio"] = n
+
+    def _block(block: dict[str, Any]) -> None:
+        mode = str(block.get("server_mode") or "").strip().lower()
+        block["server_mode"] = "self_hosted" if mode == "self_hosted" else "cloud"
+        block["base_url"] = str(block.get("base_url") or "https://api.nuvio.tv").strip().rstrip("/") or "https://api.nuvio.tv"
+        block.pop("public_client_key", None)
+        key = str(block.get("publishable_key") or "").strip()
+        if block["server_mode"] == "self_hosted" and key:
+            block["publishable_key"] = key
+        else:
+            block.pop("publishable_key", None)
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        block["refresh_token"] = str(block.get("refresh_token") or "").strip()
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        pid = block.get("profile_id")
+        if pid in (None, ""):
+            block["profile_id"] = ""
+        else:
+            try:
+                block["profile_id"] = int(pid)
+            except Exception:
+                block["profile_id"] = ""
+        block["profile_name"] = str(block.get("profile_name") or "").strip()
+
+    _block(n)
+    insts = n.get("instances")
+    if isinstance(insts, dict):
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _normalize_stremio(cfg: dict[str, Any]) -> None:
+    s0 = cfg.get("stremio")
+    if isinstance(s0, dict):
+        s = s0
+    else:
+        s = {}
+        cfg["stremio"] = s
+    insts = s.get("instances") if isinstance(s.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        key = str(block.get("auth_key") or block.get("authKey") or "").strip()
+        raw_ratings = block.get("ratings") if isinstance(block.get("ratings"), dict) else {}
+        ratings = cast(dict[str, Any], raw_ratings)
+
+        def _rating_float(name: str, default: float) -> float:
+            try:
+                value = float(str(ratings.get(name, default)).strip())
+            except Exception:
+                value = default
+            return value if 0 <= value <= 10 else default
+
+        liked_min = _rating_float("liked_min", 6.0)
+        loved_min = _rating_float("loved_min", 8.0)
+        if loved_min < liked_min:
+            loved_min = liked_min
+        block.clear()
+        block["auth_key"] = key
+        block["ratings"] = {"liked_min": liked_min, "loved_min": loved_min}
+
+    _block(s)
+    if isinstance(insts, dict):
+        s["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _normalize_floppy(cfg: dict[str, Any]) -> None:
+    f0 = cfg.get("floppy")
+    if isinstance(f0, dict):
+        f = f0
+    else:
+        f = {}
+        cfg["floppy"] = f
+    insts = f.get("instances") if isinstance(f.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        block["server_url"] = str(block.get("server_url") or "").strip().rstrip("/")
+        block["api_token"] = str(block.get("api_token") or "").strip()
+        block["verify_ssl"] = bool(block.get("verify_ssl", False))
+        try:
+            timeout = float(block.get("timeout", 12.0) or 12.0)
+        except Exception:
+            timeout = 12.0
+        block["timeout"] = max(1.0, min(timeout, 120.0))
+        block["watchlist_name"] = str(block.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+        rl0 = block.get("rate_limit") if isinstance(block.get("rate_limit"), dict) else {}
+        rl = dict(rl0 or {})
+        def _rate(key: str, default: float) -> float:
+            try:
+                value = float(rl.get(key, default))
+            except Exception:
+                value = default
+            return max(0.0, min(value, 100.0))
+        get_rps = _rate("get_per_sec", 20.0)
+        post_rps = _rate("post_per_sec", 20.0)
+        block["rate_limit"] = {
+            "get_per_sec": int(get_rps) if float(get_rps).is_integer() else get_rps,
+            "post_per_sec": int(post_rps) if float(post_rps).is_integer() else post_rps,
+        }
+
+    _block(f)
+    if isinstance(insts, dict):
+        f["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _normalize_scrob(cfg: dict[str, Any]) -> None:
+    s0 = cfg.get("scrob")
+    if isinstance(s0, dict):
+        s = s0
+    else:
+        s = {}
+        cfg["scrob"] = s
+    insts = s.get("instances") if isinstance(s.get("instances"), dict) else None
+
+    def _block(block: dict[str, Any]) -> None:
+        server = str(block.get("server_url") or "").strip().rstrip("/")
+        if server and not server.startswith(("http://", "https://")):
+            server = "http://" + server
+        block["server_url"] = server.rstrip("/")
+        block["api_key"] = str(block.get("api_key") or "").strip()
+        block["username"] = str(block.get("username") or "").strip()
+        block["password"] = str(block.get("password") or "")
+        prefix = str(block.get("api_prefix") or "").strip().strip("/")
+        block["api_prefix"] = f"/{prefix}" if prefix else ""
+        block["totp_enabled"] = bool(block.get("totp_enabled"))
+        block["reauth_required"] = bool(block.get("reauth_required"))
+        block["access_token"] = str(block.get("access_token") or "").strip()
+        try:
+            block["expires_at"] = int(block.get("expires_at") or 0)
+        except Exception:
+            block["expires_at"] = 0
+        block["verify_ssl"] = bool(block.get("verify_ssl", False))
+        try:
+            timeout = float(block.get("timeout", 12.0) or 12.0)
+        except Exception:
+            timeout = 12.0
+        block["timeout"] = max(1.0, min(timeout, 120.0))
+        block["watchlist_name"] = str(block.get("watchlist_name") or "Watchlist").strip() or "Watchlist"
+        block.pop("history_max_pages", None)
+        caps = block.get("capabilities")
+        block["capabilities"] = {str(k): bool(v) for k, v in caps.items()} if isinstance(caps, dict) else {}
+        rl0 = block.get("rate_limit") if isinstance(block.get("rate_limit"), dict) else {}
+        rl = dict(rl0 or {})
+
+        def _rate(key: str, default: float) -> float:
+            try:
+                value = float(rl.get(key, default))
+            except Exception:
+                value = default
+            return max(0.0, min(value, 100.0))
+
+        get_rps = _rate("get_per_sec", 10.0)
+        post_rps = _rate("post_per_sec", 5.0)
+        block["rate_limit"] = {
+            "get_per_sec": int(get_rps) if float(get_rps).is_integer() else get_rps,
+            "post_per_sec": int(post_rps) if float(post_rps).is_integer() else post_rps,
+        }
+
+    _block(s)
+    if isinstance(insts, dict):
+        s["instances"] = insts
+        for inst in insts.values():
+            if isinstance(inst, dict):
+                _block(inst)
+
+
+def _is_hhmm(v: str) -> bool:
+    s = (v or "").strip()
+    if len(s) != 5 or s[2] != ":":
+        return False
+    hh, mm = s[:2], s[3:]
+    if not hh.isdigit() or not mm.isdigit():
+        return False
+    try:
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        return False
+    return 0 <= h <= 23 and 0 <= m <= 59
+
+
+def _normalize_scheduling(cfg: dict[str, Any]) -> None:
+    s = _ensure_dict(cfg, "scheduling")
+    s["enabled"] = bool(s.get("enabled", False))
+
+    mode_raw = str(s.get("mode", "every_n_hours") or "every_n_hours").strip().lower()
+    if mode_raw == "disabled":
+        mode = "disabled"
+    elif mode_raw == "hourly":
+        mode = "hourly"
+        s["every_n_hours"] = 1
+    elif mode_raw == "daily_time":
+        mode = "daily_time"
+    elif mode_raw in {"custom_interval", "custom"}:
+        mode = "custom_interval"
+    elif mode_raw == "every_n_hours":
+        mode = "every_n_hours"
+    else:
+        mode = "every_n_hours"
+    s["mode"] = mode
+
+    try:
+        n = int(s.get("every_n_hours", 2) or 2)
+    except Exception:
+        n = 2
+    if n < 1:
+        n = 1
+    if mode == "every_n_hours" and n <= 1:
+        mode = "hourly"
+        s["mode"] = mode
+    s["every_n_hours"] = n
+
+    t = str(s.get("daily_time", "03:30") or "03:30").strip()
+    if not _is_hhmm(t):
+        t = "03:30"
+    s["daily_time"] = t
+
+    try:
+        custom_minutes = int(s.get("custom_interval_minutes", 60) or 60)
+    except Exception:
+        custom_minutes = 60
+    if custom_minutes < 15:
+        custom_minutes = 15
+    s["custom_interval_minutes"] = custom_minutes
+    s["webhooks"] = _normalize_scheduler_webhooks(s.get("webhooks"))
+
+    adv = _ensure_dict(s, "advanced")
+    adv["enabled"] = bool(adv.get("enabled", False))
+    backup_jobs = adv.get("backup_jobs") or adv.get("backupJobs") or []
+    if (
+        not s.get("_independent_plans_v1")
+        and s["enabled"]
+        and s["mode"] != "disabled"
+        and adv["enabled"]
+        and isinstance(backup_jobs, list)
+        and any(isinstance(job, dict) and job.get("id") == "app-backup-default" for job in backup_jobs)
+        and not any(adv.get(key) for key in ("jobs", "workflows", "capture_jobs", "captureJobs", "event_rules", "eventRules"))
+    ):
+        adv["enabled"] = False
+    s["_independent_plans_v1"] = True
+
+    jobs0 = adv.get("jobs")
+    jobs: list[dict[str, Any]] = []
+    if isinstance(jobs0, list):
+        for it in jobs0:
+            if isinstance(it, dict):
+                jobs.append(dict(it))
+
+    out: list[dict[str, Any]] = []
+    for i, j in enumerate(jobs):
+        jid = str(j.get("id") or "").strip()
+        if not jid:
+            jid = f"job_{i+1}"
+        j["id"] = jid
+
+        pair_id = j.get("pair_id")
+        if pair_id is None:
+            j["pair_id"] = None
+        else:
+            s_pair = str(pair_id).strip()
+            j["pair_id"] = s_pair or None
+
+        at = str(j.get("at") or "").strip()
+        if at and not _is_hhmm(at):
+            at = ""
+        j["at"] = at or None
+
+        after = j.get("after")
+        if after is None:
+            j["after"] = None
+        else:
+            a = str(after).strip()
+            j["after"] = a or None
+
+        days0 = j.get("days")
+        days: list[int] = []
+        if isinstance(days0, list):
+            for d in days0:
+                try:
+                    di = int(d)
+                except Exception:
+                    continue
+                if di < 1 or di > 7:
+                    continue
+                if di not in days:
+                    days.append(di)
+        j["days"] = days
+
+        j["active"] = bool(j.get("active", True))
+        out.append(j)
+
+    adv["jobs"] = out
+
+    workflows0 = adv.get("workflows")
+    workflows: list[dict[str, Any]] = []
+    if isinstance(workflows0, list):
+        for it in workflows0:
+            if isinstance(it, dict):
+                workflows.append(dict(it))
+
+    wf_out: list[dict[str, Any]] = []
+    for i, workflow in enumerate(workflows):
+        wid = str(workflow.get("id") or "").strip() or f"workflow_{i+1}"
+        workflow["id"] = wid
+        workflow["name"] = str(workflow.get("name") or "").strip()
+        wf_mode = str(workflow.get("mode") or "hourly").strip().lower()
+        if wf_mode not in {"hourly", "every_n_hours", "daily_time", "custom_interval"}:
+            wf_mode = "hourly"
+        workflow["mode"] = wf_mode
+
+        try:
+            wf_hours = int(workflow.get("every_n_hours", 1) or 1)
+        except Exception:
+            wf_hours = 1
+        workflow["every_n_hours"] = max(1, wf_hours)
+
+        wf_time = str(workflow.get("daily_time", "03:30") or "03:30").strip()
+        if not _is_hhmm(wf_time):
+            wf_time = "03:30"
+        workflow["daily_time"] = wf_time
+
+        try:
+            wf_minutes = int(workflow.get("custom_interval_minutes", 60) or 60)
+        except Exception:
+            wf_minutes = 60
+        workflow["custom_interval_minutes"] = max(15, wf_minutes)
+
+        steps0 = workflow.get("steps")
+        steps: list[dict[str, Any]] = []
+        if isinstance(steps0, list):
+            for si, raw_step in enumerate(steps0):
+                if not isinstance(raw_step, dict):
+                    continue
+                step = dict(raw_step)
+                step["id"] = str(step.get("id") or "").strip() or f"step_{si+1}"
+                pair_id = step.get("pair_id")
+                step["pair_id"] = None if pair_id is None else (str(pair_id).strip() or None)
+                step["active"] = bool(step.get("active", True))
+                steps.append(step)
+        workflow["steps"] = steps
+        workflow["active"] = bool(workflow.get("active", True))
+        wf_out.append(workflow)
+
+    adv["workflows"] = wf_out
+
+
+ANIME_MAPPING_PAIRS_DEFAULT: list[str] = ["anilist", "myanimelist", "kitsu", "simkl", "crosswatch"]
+ANIME_MAPPING_FEATURES_DEFAULT: list[str] = ["watchlist", "ratings", "history"]
+
+
+def _normalize_anime_mapping(cfg: dict[str, Any]) -> None:
+    am = _ensure_dict(cfg, "anime_mapping")
+    am["enabled"] = bool(am.get("enabled", False))
+    am["auto_update"] = bool(am.get("auto_update", True))
+
+    provider = str(am.get("provider") or "anibridge").strip().lower() or "anibridge"
+    am["provider"] = provider
+
+    tag = str(am.get("release_tag") or "v3").strip() or "v3"
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", tag):
+        tag = "v3"
+    am["release_tag"] = tag
+
+    try:
+        refresh_hours = int(am.get("refresh_hours", 24) or 24)
+    except Exception:
+        refresh_hours = 24
+    am["refresh_hours"] = max(1, refresh_hours)
+
+    try:
+        stale_after_days = int(am.get("stale_after_days", 14) or 14)
+    except Exception:
+        stale_after_days = 14
+    am["stale_after_days"] = max(1, stale_after_days)
+
+    def _string_list(value: Any, default: list[str]) -> list[str]:
+        raw = value if isinstance(value, list) else default
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            name = str(item or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out or list(default)
+
+    def _string_list_union(value: Any, default: list[str]) -> list[str]:
+        raw = value if isinstance(value, list) else []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in list(raw) + list(default):
+            name = str(item or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out or list(default)
+
+    am["use_for_pairs"] = _string_list_union(am.get("use_for_pairs"), ANIME_MAPPING_PAIRS_DEFAULT)
+    am["features"] = _string_list_union(am.get("features"), ANIME_MAPPING_FEATURES_DEFAULT)
+
+
+def _normalize_scrobble_webhook(cfg: dict[str, Any]) -> None:
+    # Drop legacy global webhook destinations
+    sc = cfg.get("scrobble")
+    if not isinstance(sc, dict):
+        return
+    wh = sc.get("webhook")
+    if not isinstance(wh, dict):
+        return
+
+    wh.pop("sinks", None)
+    wh.pop("sink_instances", None)
+
+    providers = wh.get("providers")
+    if isinstance(providers, dict):
+        for prov in list(providers.keys()):
+            node = providers.get(prov)
+            if not isinstance(node, dict):
+                continue
+            node.pop("sinks", None)
+            node.pop("sink_instances", None)
+            if not node:
+                del providers[prov]
+        if not providers:
+            wh.pop("providers", None)
+
+    # Empty per-profile sink overrides
+    profiles = wh.get("profiles")
+    if isinstance(profiles, dict):
+        for prov in list(profiles.keys()):
+            prov_node = profiles.get(prov)
+            if not isinstance(prov_node, dict):
+                continue
+            for inst in list(prov_node.keys()):
+                node = prov_node.get(inst)
+                if not isinstance(node, dict):
+                    continue
+                if isinstance(node.get("sinks"), list) and not node.get("sinks"):
+                    node.pop("sinks", None)
+                    node.pop("sink_instances", None)
+                if not node:
+                    del prov_node[inst]
+            if not prov_node:
+                del profiles[prov]
+        if not profiles:
+            wh.pop("profiles", None)
+
+
+def _normalize_ui(cfg: dict[str, Any]) -> None:
+    ui = _ensure_dict(cfg, "ui")
+
+    theme = str(ui.get("theme", "flat-dark") or "flat-dark").strip().lower()
+    if theme not in {"flat-dark", "flat-light", "original"}:
+        theme = "flat-dark"
+    ui["theme"] = theme
+
+    ui["show_watchlist_preview"] = bool(ui.get("show_watchlist_preview", True))
+    ui["show_playingcard"] = bool(ui.get("show_playingcard", True))
+    ui["show_recent_activity"] = bool(ui.get("show_recent_activity", True))
+    ui["show_recent_history_widget"] = bool(ui.get("show_recent_history_widget", True))
+    ui["show_latest_ratings_widget"] = bool(ui.get("show_latest_ratings_widget", True))
+    ui["show_recent_scrobble_widget"] = bool(ui.get("show_recent_scrobble_widget", True))
+    ui["show_recent_progress_widget"] = bool(ui.get("show_recent_progress_widget", False))
+    ui["show_recent_playlists_widget"] = bool(ui.get("show_recent_playlists_widget", False))
+    ui["show_quick_add_desktop"] = bool(ui.get("show_quick_add_desktop", True))
+    ui["show_quick_add_mobile"] = bool(ui.get("show_quick_add_mobile", True))
+
+    def _ui_limit(name: str, default: int = 3) -> int:
+        try:
+            n = int(ui.get(name, default) or default)
+        except Exception:
+            n = default
+        ui[name] = max(3, min(n, 5))
+        return int(ui[name])
+
+    def _ui_display(display_name: str, limit_name: str) -> None:
+        legacy_limit = _ui_limit(limit_name)
+        raw = str(ui.get(display_name) or "").strip().lower()
+        mode, _, value = raw.partition(":")
+        if mode == "count":
+            try:
+                n = int(value)
+            except Exception:
+                n = legacy_limit
+            n = max(3, min(n, 5))
+            ui[display_name] = f"count:{n}"
+            ui[limit_name] = n
+            return
+        if mode == "hours":
+            try:
+                n = int(value)
+            except Exception:
+                n = 24
+            if n not in {24, 48, 72}:
+                n = 24
+            ui[display_name] = f"hours:{n}"
+            ui[limit_name] = 5
+            return
+        ui[display_name] = f"count:{legacy_limit}"
+
+    _ui_display("recent_activity_display", "recent_activity_limit")
+    _ui_display("recent_syncs_display", "recent_syncs_limit")
+
+    protocol = str(ui.get("protocol", "http") or "http").strip().lower()
+    if protocol not in _ALLOWED_UI_PROTOCOLS:
+        protocol = "http"
+    ui["protocol"] = protocol
+
+    tls = _ensure_dict(ui, "tls")
+    tls["self_signed"] = bool(tls.get("self_signed", True))
+
+    hostname = str(tls.get("hostname", "localhost") or "localhost").strip()
+    tls["hostname"] = hostname or "localhost"
+
+    try:
+        valid_days = int(tls.get("valid_days", 825) or 825)
+    except Exception:
+        valid_days = 825
+    if valid_days < 1:
+        valid_days = 1
+    if valid_days > 3650:
+        valid_days = 3650
+    tls["valid_days"] = valid_days
+
+    tls["cert_file"] = str(tls.get("cert_file", "") or "").strip()
+    tls["key_file"] = str(tls.get("key_file", "") or "").strip()
+
+
+def _normalize_pair_profile_ids(cfg: dict[str, Any]) -> None:
+    pairs = cfg.get("pairs")
+    if not isinstance(pairs, list):
+        return
+
+    def _normalize_user_profile_id(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    try:
+        from cw_platform.provider_instances import list_user_profiles
+
+        valid = {_normalize_user_profile_id(row.get("id")) for row in list_user_profiles(cfg) if _normalize_user_profile_id(row.get("id"))}
+    except Exception:
+        valid = set()
+
+    for it in pairs:
+        if not isinstance(it, dict):
+            continue
+        pid = _normalize_user_profile_id(it.get("profile_id"))
+        if pid and pid in valid:
+            it["profile_id"] = pid
+        else:
+            it.pop("profile_id", None)
+
+
+def _new_resource_id(prefix: str) -> str:
+    return f"{prefix}_{secrets.token_hex(6)}"
+
+
+def _clean_resource_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _unique_resource_id(prefix: str, used: set[str]) -> str:
+    for _ in range(100):
+        rid = _new_resource_id(prefix)
+        if rid not in used:
+            return rid
+    raise RuntimeError("unable to allocate config resource id")
+
+
+def _replace_string_ref(node: dict[str, Any], key: str, refs: dict[str, str]) -> bool:
+    raw = node.get(key)
+    value = _clean_resource_id(raw)
+    if value and value in refs:
+        node[key] = refs[value]
+        return True
+    return False
+
+
+def _rewrite_scheduler_resource_refs(cfg: dict[str, Any], pair_refs: dict[str, str], route_refs: dict[str, str]) -> list[str]:
+    if not pair_refs and not route_refs:
+        return []
+    changed: list[str] = []
+    scheduling = cfg.get("scheduling")
+    if not isinstance(scheduling, dict):
+        return changed
+    advanced = scheduling.get("advanced")
+    if not isinstance(advanced, dict):
+        return changed
+
+    jobs = advanced.get("jobs")
+    if isinstance(jobs, list):
+        for idx, job in enumerate(jobs):
+            if isinstance(job, dict) and _replace_string_ref(job, "pair_id", pair_refs):
+                changed.append(f"scheduling.advanced.jobs[{idx}].pair_id")
+
+    workflows = advanced.get("workflows")
+    if isinstance(workflows, list):
+        for wi, workflow in enumerate(workflows):
+            steps = workflow.get("steps") if isinstance(workflow, dict) else None
+            if not isinstance(steps, list):
+                continue
+            for si, step in enumerate(steps):
+                if isinstance(step, dict) and _replace_string_ref(step, "pair_id", pair_refs):
+                    changed.append(f"scheduling.advanced.workflows[{wi}].steps[{si}].pair_id")
+
+    event_rules = advanced.get("event_rules")
+    if not isinstance(event_rules, list):
+        event_rules = advanced.get("eventRules")
+    if isinstance(event_rules, list):
+        for ri, rule in enumerate(event_rules):
+            if not isinstance(rule, dict):
+                continue
+            action = rule.get("action")
+            if isinstance(action, dict):
+                if _replace_string_ref(action, "pair_id", pair_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].action.pair_id")
+                if _replace_string_ref(action, "pairId", pair_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].action.pairId")
+            elif _replace_string_ref(rule, "pair_id", pair_refs):
+                changed.append(f"scheduling.advanced.event_rules[{ri}].pair_id")
+            source = str(rule.get("source") or "watcher").strip().lower() or "watcher"
+            filters = rule.get("filters")
+            if source == "watcher" and isinstance(filters, dict):
+                if _replace_string_ref(filters, "route_id", route_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].filters.route_id")
+                if _replace_string_ref(filters, "routeId", route_refs):
+                    changed.append(f"scheduling.advanced.event_rules[{ri}].filters.routeId")
+    return changed
+
+
+def ensure_config_resource_ids(cfg: dict[str, Any]) -> list[str]:
+    """Persist stable IDs for legacy resource rows that used positional fallbacks."""
+    changed: list[str] = []
+    pair_refs: dict[str, str] = {}
+    route_refs: dict[str, str] = {}
+
+    pairs = cfg.get("pairs")
+    if isinstance(pairs, list):
+        used: set[str] = set()
+        for idx, pair in enumerate(pairs):
+            if not isinstance(pair, dict):
+                continue
+            raw_id = _clean_resource_id(pair.get("id"))
+            raw_pair_id = _clean_resource_id(pair.get("pair_id"))
+            candidate = raw_id or raw_pair_id
+            if candidate and candidate not in used:
+                if pair.get("id") != candidate:
+                    pair["id"] = candidate
+                    changed.append(f"pairs[{idx}].id")
+                used.add(candidate)
+                continue
+            rid = _unique_resource_id("pair", used)
+            pair["id"] = rid
+            used.add(rid)
+            changed.append(f"pairs[{idx}].id")
+            legacy = f"pair-{idx + 1}"
+            if not candidate:
+                pair_refs[legacy] = rid
+
+    scrobble = cfg.get("scrobble")
+    watch = scrobble.get("watch") if isinstance(scrobble, dict) else None
+    routes = watch.get("routes") if isinstance(watch, dict) else None
+    if isinstance(routes, list):
+        used_routes: set[str] = set()
+        for idx, route in enumerate(routes):
+            if not isinstance(route, dict):
+                continue
+            raw_id = _clean_resource_id(route.get("id"))
+            raw_route_id = _clean_resource_id(route.get("route_id"))
+            candidate = raw_id or raw_route_id
+            if candidate and candidate not in used_routes:
+                if route.get("id") != candidate:
+                    route["id"] = candidate
+                    changed.append(f"scrobble.watch.routes[{idx}].id")
+                used_routes.add(candidate)
+                continue
+            rid = _unique_resource_id("route", used_routes)
+            route["id"] = rid
+            used_routes.add(rid)
+            changed.append(f"scrobble.watch.routes[{idx}].id")
+            legacy = f"R{idx + 1}"
+            if not candidate:
+                route_refs[legacy] = rid
+
+    changed.extend(_rewrite_scheduler_resource_refs(cfg, pair_refs, route_refs))
+    return changed
+
+
+def cleanup_invalid_resource_profile_ids(cfg: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    try:
+        from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
+
+        valid = {normalize_user_profile_id(row.get("id")) for row in list_user_profiles(cfg)}
+        valid = {pid for pid in valid if pid}
+    except Exception:
+        return changed
+
+    def clean_pid(value: Any) -> str:
+        pid = normalize_user_profile_id(value)
+        return pid if pid and pid in valid else ""
+
+    scrobble = cfg.get("scrobble")
+    watch = scrobble.get("watch") if isinstance(scrobble, dict) else None
+    routes = watch.get("routes") if isinstance(watch, dict) else None
+    if isinstance(routes, list):
+        for idx, route in enumerate(routes):
+            if not isinstance(route, dict):
+                continue
+            raw = route.get("profile_id") if "profile_id" in route else route.get("profileId")
+            pid = clean_pid(raw)
+            if pid:
+                if route.get("profile_id") != pid:
+                    route["profile_id"] = pid
+                    changed.append(f"scrobble.watch.routes[{idx}].profile_id")
+                if "profileId" in route:
+                    route.pop("profileId", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profileId")
+            else:
+                if "profile_id" in route:
+                    route.pop("profile_id", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profile_id")
+                if "profileId" in route:
+                    route.pop("profileId", None)
+                    changed.append(f"scrobble.watch.routes[{idx}].profileId")
+
+    webhook = scrobble.get("webhook") if isinstance(scrobble, dict) else None
+    assignments = webhook.get("user_profile_assignments") if isinstance(webhook, dict) else None
+    if isinstance(webhook, dict) and isinstance(assignments, dict):
+        for resource_id, value in list(assignments.items()):
+            pid = clean_pid(value)
+            if pid:
+                if assignments.get(resource_id) != pid:
+                    assignments[resource_id] = pid
+                    changed.append(f"scrobble.webhook.user_profile_assignments.{resource_id}")
+            else:
+                assignments.pop(resource_id, None)
+                changed.append(f"scrobble.webhook.user_profile_assignments.{resource_id}")
+        if not assignments:
+            webhook.pop("user_profile_assignments", None)
+            changed.append("scrobble.webhook.user_profile_assignments")
+    elif isinstance(webhook, dict) and "user_profile_assignments" in webhook:
+        webhook.pop("user_profile_assignments", None)
+        changed.append("scrobble.webhook.user_profile_assignments")
+
+    return changed
+
+
+def _normalize_app_auth(cfg: dict[str, Any]) -> None:
+    a = _ensure_dict(cfg, "app_auth")
+    raw_enabled = bool(a.get("enabled", False))
+    a["username"] = str(a.get("username", "") or "").strip()
+    a["reset_required"] = bool(a.get("reset_required", False))
+    a["remember_session_enabled"] = bool(a.get("remember_session_enabled", False))
+
+    try:
+        remember_days = int(a.get("remember_session_days", 30) or 30)
+    except Exception:
+        remember_days = 30
+    if remember_days < 1:
+        remember_days = 1
+    if remember_days > 365:
+        remember_days = 365
+    a["remember_session_days"] = remember_days
+
+    plex_sso = _ensure_dict(a, "plex_sso")
+    plex_sso["enabled"] = bool(plex_sso.get("enabled", False))
+    plex_sso["client_id"] = str(plex_sso.get("client_id", "") or "").strip()
+    plex_sso["linked_plex_account_id"] = str(plex_sso.get("linked_plex_account_id", "") or "").strip()
+    plex_sso["linked_username"] = str(plex_sso.get("linked_username", "") or "").strip()
+    plex_sso["linked_email"] = str(plex_sso.get("linked_email", "") or "").strip()
+    plex_sso["linked_thumb"] = str(plex_sso.get("linked_thumb", "") or "").strip()
+    try:
+        plex_sso["linked_at"] = int(plex_sso.get("linked_at", 0) or 0)
+    except Exception:
+        plex_sso["linked_at"] = 0
+    if not plex_sso["linked_plex_account_id"]:
+        plex_sso["linked_username"] = ""
+        plex_sso["linked_email"] = ""
+        plex_sso["linked_thumb"] = ""
+        plex_sso["linked_at"] = 0
+
+    oidc = _ensure_dict(a, "oidc")
+    oidc["enabled"] = bool(oidc.get("enabled", False))
+    oidc["issuer"] = str(oidc.get("issuer", "") or "").strip().rstrip("/")
+    oidc["client_id"] = str(oidc.get("client_id", "") or "").strip()
+    oidc["client_secret"] = str(oidc.get("client_secret", "") or "").strip()
+    scopes = str(oidc.get("scopes", "openid profile email") or "openid profile email").strip()
+    scope_parts: list[str] = []
+    for scope in scopes.split():
+        if scope and scope not in scope_parts:
+            scope_parts.append(scope)
+    if "openid" not in scope_parts:
+        scope_parts.insert(0, "openid")
+    oidc["scopes"] = " ".join(scope_parts)
+    if not oidc["issuer"] or not oidc["client_id"]:
+        oidc["enabled"] = False
+
+    oidc_identity = a.get("oidc_identity")
+    if isinstance(oidc_identity, dict):
+        clean_oidc_identity: dict[str, Any] = {
+            "iss": str(oidc_identity.get("iss", "") or "").strip().rstrip("/"),
+            "sub": str(oidc_identity.get("sub", "") or "").strip(),
+            "username": str(oidc_identity.get("username", "") or "").strip(),
+            "email": str(oidc_identity.get("email", "") or "").strip(),
+            "picture": str(oidc_identity.get("picture", "") or "").strip(),
+        }
+        try:
+            clean_oidc_identity["linked_at"] = int(oidc_identity.get("linked_at", 0) or 0)
+        except Exception:
+            clean_oidc_identity["linked_at"] = 0
+        if clean_oidc_identity["iss"] and clean_oidc_identity["sub"]:
+            a["oidc_identity"] = clean_oidc_identity
+        else:
+            a.pop("oidc_identity", None)
+    else:
+        a.pop("oidc_identity", None)
+
+    pwd = _ensure_dict(a, "password")
+    pwd["scheme"] = str(pwd.get("scheme", "pbkdf2_sha256") or "pbkdf2_sha256").strip() or "pbkdf2_sha256"
+    try:
+        pwd["iterations"] = int(pwd.get("iterations", 260_000) or 260_000)
+    except Exception:
+        pwd["iterations"] = 260_000
+    pwd["salt"] = str(pwd.get("salt", "") or "").strip()
+    pwd["hash"] = str(pwd.get("hash", "") or "").strip()
+
+    atotp = _ensure_dict(a, "totp")
+    atotp["enabled"] = bool(atotp.get("enabled", False))
+    atotp["secret"] = str(atotp.get("secret", "") or "").strip()
+    atotp["pending_secret"] = str(atotp.get("pending_secret", "") or "").strip()
+    try:
+        atotp["pending_created_at"] = int(atotp.get("pending_created_at", 0) or 0)
+    except Exception:
+        atotp["pending_created_at"] = 0
+    if not atotp["secret"]:
+        atotp["enabled"] = False
+
+    has_configured_credentials = bool(a["username"] and pwd["salt"] and pwd["hash"])
+
+    # Auth is mandatory
+    if not raw_enabled and has_configured_credentials:
+        a["reset_required"] = True
+        a["remember_session_enabled"] = bool(a.get("remember_session_enabled", False))
+
+    a["enabled"] = True
+
+    sess = _ensure_dict(a, "session")
+    sess["token_hash"] = str(sess.get("token_hash", "") or "").strip()
+    try:
+        sess["expires_at"] = int(sess.get("expires_at", 0) or 0)
+    except Exception:
+        sess["expires_at"] = 0
+
+    sessions = a.get("sessions")
+    a["sessions"] = sessions if isinstance(sessions, list) else []
+
+    api_tokens = a.get("api_tokens")
+    a["api_tokens"] = [x for x in api_tokens if isinstance(x, dict)] if isinstance(api_tokens, list) else []
+
+    try:
+        a["last_login_at"] = int(a.get("last_login_at", 0) or 0)
+    except Exception:
+        a["last_login_at"] = 0
+
+    raw_users = a.get("users")
+    clean_users: dict[str, Any] = {}
+
+    def _clean_managed_display_name(raw_user: dict[str, Any]) -> str:
+        return " ".join(str(raw_user.get("display_name", "") or "").strip().split())[:64]
+
+    def _clean_managed_recovery_codes(raw_user: dict[str, Any]) -> list[dict[str, Any]]:
+        codes = raw_user.get("recovery_codes")
+        if not isinstance(codes, list):
+            return []
+        return [dict(row) for row in codes if isinstance(row, dict)]
+
+    def _clean_managed_avatar(raw_user: dict[str, Any]) -> dict[str, Any]:
+        avatar = raw_user.get("avatar")
+        if not isinstance(avatar, dict):
+            return {}
+        raw_file = str(avatar.get("file") or "")
+        if "/" in raw_file or "\\" in raw_file:
+            return {}
+        name = os.path.basename(raw_file)
+        if not re.fullmatch(r"[a-f0-9]{32}\.(png|jpg|webp)", name):
+            return {}
+        content_type = str(avatar.get("content_type") or "").strip().lower()
+        if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            return {}
+        try:
+            updated_at = int(avatar.get("updated_at", 0) or 0)
+        except Exception:
+            updated_at = 0
+        return {"file": name, "content_type": content_type, "updated_at": updated_at}
+
+    def _clean_managed_preferences(raw_user: dict[str, Any]) -> dict[str, Any]:
+        prefs = raw_user.get("preferences")
+        if not isinstance(prefs, dict):
+            return {}
+        return clean_user_preferences(prefs)
+
+    def _clean_managed_plex_sso(raw_user: dict[str, Any]) -> dict[str, Any]:
+        plex_sso_user = raw_user.get("plex_sso")
+        if not isinstance(plex_sso_user, dict):
+            return {}
+        account_id = str(plex_sso_user.get("account_id") or plex_sso_user.get("linked_plex_account_id") or "").strip()
+        if not account_id:
+            return {}
+        try:
+            linked_at = int(plex_sso_user.get("linked_at", 0) or 0)
+        except Exception:
+            linked_at = 0
+        return {
+            "account_id": account_id,
+            "username": str(plex_sso_user.get("username") or plex_sso_user.get("linked_username") or "").strip(),
+            "email": str(plex_sso_user.get("email") or plex_sso_user.get("linked_email") or "").strip(),
+            "thumb": str(plex_sso_user.get("thumb") or plex_sso_user.get("linked_thumb") or "").strip(),
+            "linked_at": linked_at,
+        }
+
+    def _clean_managed_oidc(raw_user: dict[str, Any]) -> dict[str, Any]:
+        oidc_user = raw_user.get("oidc")
+        if not isinstance(oidc_user, dict):
+            return {}
+        iss = str(oidc_user.get("iss") or "").strip().rstrip("/")
+        sub = str(oidc_user.get("sub") or "").strip()
+        if not iss or not sub:
+            return {}
+        try:
+            linked_at = int(oidc_user.get("linked_at", 0) or 0)
+        except Exception:
+            linked_at = 0
+        return {
+            "iss": iss,
+            "sub": sub,
+            "username": str(oidc_user.get("username") or "").strip(),
+            "email": str(oidc_user.get("email") or "").strip(),
+            "picture": str(oidc_user.get("picture") or "").strip(),
+            "linked_at": linked_at,
+        }
+
+    raw_admin_profile = dict(a)
+    a.pop("display_name", None)
+    a.pop("recovery_codes", None)
+    a.pop("avatar", None)
+    a.pop("preferences", None)
+    display_name = _clean_managed_display_name(raw_admin_profile)
+    if display_name:
+        a["display_name"] = display_name
+    recovery_codes = _clean_managed_recovery_codes(raw_admin_profile)
+    if recovery_codes:
+        a["recovery_codes"] = recovery_codes
+    avatar = _clean_managed_avatar(raw_admin_profile)
+    if avatar:
+        a["avatar"] = avatar
+    preferences = _clean_managed_preferences(raw_admin_profile)
+    if preferences:
+        a["preferences"] = preferences
+
+    if isinstance(raw_users, dict):
+        for raw_id, raw_user in raw_users.items():
+            uid_raw = str(raw_id or "").strip().lower()
+            uid_compact = uid_raw.replace("-", "")
+            if re.fullmatch(r"[a-f0-9]{32}", uid_compact):
+                uid = uid_compact
+            elif re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", uid_raw):
+                uid = uid_raw
+            else:
+                continue
+            if not isinstance(raw_user, dict):
+                continue
+            username = " ".join(str(raw_user.get("username", "") or "").strip().split())[:64]
+            if not username:
+                continue
+            upwd_raw = raw_user.get("password")
+            if not isinstance(upwd_raw, dict):
+                continue
+            try:
+                user_iters = int(upwd_raw.get("iterations", 260_000) or 260_000)
+            except Exception:
+                user_iters = 260_000
+            upwd = {
+                "scheme": str(upwd_raw.get("scheme", "pbkdf2_sha256") or "pbkdf2_sha256").strip() or "pbkdf2_sha256",
+                "iterations": user_iters,
+                "salt": str(upwd_raw.get("salt", "") or "").strip(),
+                "hash": str(upwd_raw.get("hash", "") or "").strip(),
+            }
+            if not upwd["salt"] or not upwd["hash"]:
+                continue
+            perms_raw = raw_user.get("permissions")
+            perms = perms_raw if isinstance(perms_raw, dict) else {}
+            raw_totp = raw_user.get("totp")
+            user_totp = raw_totp if isinstance(raw_totp, dict) else {}
+            clean_totp = {
+                "enabled": bool(user_totp.get("enabled", False)),
+                "secret": str(user_totp.get("secret", "") or "").strip(),
+                "pending_secret": str(user_totp.get("pending_secret", "") or "").strip(),
+            }
+            try:
+                clean_totp["pending_created_at"] = int(user_totp.get("pending_created_at", 0) or 0)
+            except Exception:
+                clean_totp["pending_created_at"] = 0
+            if not clean_totp["secret"]:
+                clean_totp["enabled"] = False
+            clean_user = {
+                "username": username,
+                "enabled": bool(raw_user.get("enabled", True)),
+                "role": "user",
+                "profile_id": str(raw_user.get("profile_id", "") or "").strip().lower(),
+                "permissions": {
+                    "dashboard": perms.get("monitor") is not True and bool(perms.get("dashboard", True)),
+                    "watchlist": perms.get("monitor") is not True and bool(perms.get("watchlist", True)),
+                    "playback": perms.get("monitor") is not True and bool(perms.get("playback", True)),
+                    "write": perms.get("monitor") is not True and bool(perms.get("write", False)),
+                    "monitor": perms.get("monitor") is True,
+                    **{key: False for key in ("pairs", "scrobbler", "schedule", "connections") if perms.get(key) is False},
+                },
+                "password": upwd,
+                "totp": clean_totp,
+            }
+            display_name = _clean_managed_display_name(raw_user)
+            if display_name:
+                clean_user["display_name"] = display_name
+            recovery_codes = _clean_managed_recovery_codes(raw_user)
+            if recovery_codes:
+                clean_user["recovery_codes"] = recovery_codes
+            avatar = _clean_managed_avatar(raw_user)
+            if avatar:
+                clean_user["avatar"] = avatar
+            preferences = _clean_managed_preferences(raw_user)
+            if preferences:
+                clean_user["preferences"] = preferences
+            plex_sso_user = _clean_managed_plex_sso(raw_user)
+            if plex_sso_user:
+                clean_user["plex_sso"] = plex_sso_user
+            oidc_user = _clean_managed_oidc(raw_user)
+            if oidc_user:
+                clean_user["oidc"] = oidc_user
+            clean_users[uid] = clean_user
+    a["users"] = clean_users
+
+    if a["reset_required"]:
+        sess = _ensure_dict(a, "session")
+        sess["token_hash"] = ""
+        sess["expires_at"] = 0
+        a["sessions"] = []
+        a["last_login_at"] = 0
+
+
+# Public API
+def _new_webhook_id() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _ensure_webhook_ids(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    sec = cfg.setdefault("security", {})
+    if not isinstance(sec, dict):
+        cfg["security"] = {}
+        sec = cfg["security"]
+    wh = sec.setdefault("webhook_ids", {})
+    if not isinstance(wh, dict):
+        sec["webhook_ids"] = {}
+        wh = sec["webhook_ids"]
+
+# temp flag to remove legacy webhooks from config if present
+    legacy_removed = bool(sec.get("legacy_webhooks_removed"))
+    required = ["plexwatcher"] if legacy_removed else ["plextrakt", "jellyfintrakt", "embytrakt", "plexwatcher"]
+
+    changed = False
+    if legacy_removed:
+        for k in ("plextrakt", "jellyfintrakt", "embytrakt"):
+            if k in wh:
+                wh.pop(k, None)
+                changed = True
+
+    for k in required:
+        v = wh.get(k)
+        if not isinstance(v, str) or len(v.strip()) < 16:
+            wh[k] = _new_webhook_id()
+            changed = True
+
+    return cfg, changed
+
+def invalidate_config_cache() -> None:
+    with _CFG_CACHE_LOCK:
+        _CFG_CACHE.clear()
+
+
+def _config_stamp(p: Path) -> tuple[Any, ...] | None:
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (str(p), st.st_mtime_ns, st.st_size)
+
+
+def load_config() -> dict[str, Any]:
+    p = _cfg_file()
+    stamp = _config_stamp(p)
+    if stamp is not None:
+        with _CFG_CACHE_LOCK:
+            cached = _CFG_CACHE.get(stamp)
+        if cached is not None:
+            return copy.deepcopy(cached)
+    first_run = not p.exists()
+    user_cfg: dict[str, Any] = {}
+    if p.exists():
+        try:
+            user_cfg = _transform_secret_tree(_read_json(p), decrypt=True)
+        except Exception as e:
+            raise RuntimeError(f"Invalid config file: {p}") from e
+
+    _normalize_tracker_snapshot_defaults(user_cfg)
+    cfg = _deep_merge(DEFAULT_CFG, user_cfg)
+    _normalize_tracker_snapshot_defaults(cfg)
+    cfg.setdefault("version", _current_version_norm())
+    try:
+        user_cw = user_cfg.get("crosswatch") if isinstance(user_cfg.get("crosswatch"), dict) else user_cfg.get("CrossWatch")
+        cw = cfg.get("crosswatch")
+        if isinstance(cw, dict):
+            if isinstance(user_cw, dict) and "connected" not in user_cw:
+                cw["connected"] = user_cw.get("enabled") is not False
+            elif not isinstance(user_cw, dict):
+                cw["connected"] = bool(first_run)
+            user_insts = user_cw.get("instances") if isinstance(user_cw, dict) else None
+            insts = cw.get("instances")
+            if isinstance(user_insts, dict) and isinstance(insts, dict):
+                for inst_id, inst_block in insts.items():
+                    user_inst = user_insts.get(inst_id)
+                    if (
+                        isinstance(inst_block, dict)
+                        and isinstance(user_inst, dict)
+                        and "connected" not in user_inst
+                        and user_inst.get("enabled") is not False
+                    ):
+                        inst_block["connected"] = True
+    except Exception:
+        pass
+    cleanup_obsolete_config_keys(cfg)
+    _normalize_tmdb_sync(cfg)
+    _normalize_trakt(cfg)
+    _normalize_simkl(cfg)
+    _normalize_mdblist(cfg)
+    _normalize_publicmetadb(cfg)
+    _normalize_nuvio(cfg)
+    _normalize_stremio(cfg)
+    _normalize_floppy(cfg)
+    _normalize_scrob(cfg)
+    _normalize_anime_mapping(cfg)
+    _normalize_scheduling(cfg)
+    _normalize_app_auth(cfg)
+    _normalize_scrobble_webhook(cfg)
+    _normalize_pair_profile_ids(cfg)
+    cleanup_invalid_resource_profile_ids(cfg)
+    pairs = cfg.get("pairs")
+    if isinstance(pairs, list):
+        for it in pairs:
+            if isinstance(it, dict):
+                it["features"] = _normalize_features_map(it.get("features"))  # type: ignore[arg-type]
+    _normalize_ui(cfg)
+    try:
+        from cw_platform.provider_instances import ensure_provider_instance_uids
+
+        ensure_provider_instance_uids(cfg)
+    except Exception:
+        pass
+
+    # First-run marker for welcome/setup
+    if first_run:
+        try:
+            ui = cfg.get("ui")
+            if isinstance(ui, dict):
+                ui.setdefault("_autogen", True)
+        except Exception:
+            pass
+
+    try:
+        cfg, _ = _ensure_webhook_ids(cfg)
+    except Exception:
+        pass
+
+    if stamp is not None and stamp == _config_stamp(p):
+        with _CFG_CACHE_LOCK:
+            _CFG_CACHE.clear()
+            _CFG_CACHE[stamp] = copy.deepcopy(cfg)
+
+    return cfg
+
+
+_ROTATING_TOKEN_EXPIRY: dict[str, str] = {
+    "trakt": "expires_at",
+    "simkl": "token_expires_at",
+    "mdblist": "expires_at",
+    "myanimelist": "expires_at",
+    "wetrakr": "expires_at",
+    "nuvio": "expires_at",
+    "punchplay": "expires_at",
+}
+_ROTATING_TOKEN_FIELDS: tuple[str, ...] = (
+    "access_token",
+    "refresh_token",
+    "token_type",
+    "scope",
+    "refresh_expires_at",
+    "auth_error",
+)
+_TOKEN_LINEAGE_KEY = "_rotated_refresh_tokens"
+_TOKEN_LINEAGE_MAX = 8
+
+
+def _log_config_debug(msg: str) -> None:
+    try:
+        from _logging import log
+
+        log(msg, level="DEBUG", module="CONFIG")
+    except Exception:
+        pass
+
+
+def _save_caller() -> str:
+    try:
+        here = os.path.normcase(os.path.abspath(__file__))
+        frame = sys._getframe(1)
+        while frame is not None:
+            filename = frame.f_code.co_filename
+            if os.path.normcase(os.path.abspath(filename)) != here and "contextlib" not in filename:
+                return f"{Path(filename).name}:{frame.f_code.co_name}:{frame.f_lineno}"
+            frame = frame.f_back
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _token_lineage(block: dict[str, Any]) -> list[str]:
+    raw = block.get(_TOKEN_LINEAGE_KEY)
+    return [str(x) for x in raw if str(x or "").strip()] if isinstance(raw, list) else []
+
+
+def _keep_newer_token(new: dict[str, Any], old: dict[str, Any], expiry_key: str) -> bool:
+    new_rt = str(new.get("refresh_token") or "").strip()
+    old_rt = str(old.get("refresh_token") or "").strip()
+    old_lineage = _token_lineage(old)
+    if not new_rt or not old_rt:
+        return False
+    if new_rt == old_rt:
+        if old_lineage:
+            new[_TOKEN_LINEAGE_KEY] = old_lineage
+        return False
+    if _token_digest(new_rt) in old_lineage:
+        for key in (*_ROTATING_TOKEN_FIELDS, expiry_key, _TOKEN_LINEAGE_KEY):
+            if key in old:
+                new[key] = copy.deepcopy(old[key])
+            else:
+                new.pop(key, None)
+        return True
+    new[_TOKEN_LINEAGE_KEY] = ([_token_digest(old_rt)] + old_lineage)[:_TOKEN_LINEAGE_MAX]
+    return False
+
+
+def _preserve_rotated_tokens(data: dict[str, Any], prev: dict[str, Any]) -> list[str]:
+    kept: list[str] = []
+    for provider, expiry_key in _ROTATING_TOKEN_EXPIRY.items():
+        new_root = data.get(provider)
+        old_root = prev.get(provider)
+        if not isinstance(new_root, dict) or not isinstance(old_root, dict):
+            continue
+        pairs: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("default", new_root, old_root)]
+        new_insts = new_root.get("instances")
+        old_insts = old_root.get("instances")
+        if isinstance(new_insts, dict) and isinstance(old_insts, dict):
+            for inst, blk in new_insts.items():
+                old_blk = old_insts.get(inst)
+                if isinstance(blk, dict) and isinstance(old_blk, dict):
+                    pairs.append((str(inst), blk, old_blk))
+        for inst, blk, old_blk in pairs:
+            if _keep_newer_token(blk, old_blk, expiry_key):
+                kept.append(f"{provider}:{inst}")
+    return kept
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    with _config_io_lock():
+        _save_config_locked(cfg)
+
+
+def _save_config_locked(cfg: dict[str, Any]) -> None:
+    data: dict[str, Any] = dict(cfg or {})
+    prev_version = str(data.get("version") or "").strip()
+    try:
+        ui0 = data.get("ui")
+        if isinstance(ui0, dict):
+            pending0 = str(ui0.get("_pending_upgrade_from_version") or "").strip()
+            if not pending0 and prev_version and _current_version_norm() != prev_version:
+                ui0["_pending_upgrade_from_version"] = prev_version
+    except Exception:
+        pass
+    data["version"] = _current_version_norm()
+    cleanup_obsolete_config_keys(data)
+    _normalize_tracker_snapshot_defaults(data)
+    _normalize_tmdb_sync(data)
+    _normalize_trakt(data)
+    _normalize_simkl(data)
+    _normalize_mdblist(data)
+    _normalize_publicmetadb(data)
+    _normalize_nuvio(data)
+    _normalize_stremio(data)
+    _normalize_floppy(data)
+    _normalize_scrob(data)
+    _normalize_anime_mapping(data)
+    ensure_config_resource_ids(data)
+    _normalize_scheduling(data)
+    _normalize_app_auth(data)
+    _normalize_scrobble_webhook(data)
+    _normalize_ui(data)
+    _normalize_pair_profile_ids(data)
+    cleanup_invalid_resource_profile_ids(data)
+    try:
+        from cw_platform.provider_instances import ensure_provider_instance_uids
+
+        ensure_provider_instance_uids(data)
+    except Exception:
+        pass
+    pairs = data.get("pairs")
+    if isinstance(pairs, list):
+        for it in pairs:
+            if isinstance(it, dict):
+                it["features"] = _normalize_features_map(it.get("features"))  # type: ignore[arg-type]
+
+    prev_raw: dict[str, Any] = {}
+    try:
+        p = _cfg_file()
+        if p.exists():
+            prev_raw = _read_json(p)
+    except Exception:
+        prev_raw = {}
+
+    try:
+        prev_cfg = cast(dict[str, Any], _transform_secret_tree(prev_raw, decrypt=True)) if isinstance(prev_raw, dict) else {}
+    except Exception:
+        prev_cfg = {}
+
+    if not bool(getattr(_CONFIG_FILE_LOCK_STATE, "atomic_update", False)):
+        prev_auth = prev_cfg.get("app_auth") if isinstance(prev_cfg, dict) else None
+        if isinstance(prev_auth, dict):
+            data["app_auth"] = prev_auth
+
+    try:
+        kept = _preserve_rotated_tokens(data, prev_cfg)
+        if kept:
+            _log_config_debug(f"kept newer rotated tokens over a stale config write: {', '.join(kept)} (caller={_save_caller()})")
+    except Exception:
+        pass
+
+    final_data = _order_config_for_write(cast(dict[str, Any], _encrypt_secret_tree_stable(data, prev_raw)))
+    _write_json_atomic(_cfg_file(), final_data)
+
+
+def update_config(mutator: Any) -> tuple[dict[str, Any], Any]:
+    with _config_io_lock():
+        cfg = load_config()
+        result = mutator(cfg)
+        prev_atomic = bool(getattr(_CONFIG_FILE_LOCK_STATE, "atomic_update", False))
+        _CONFIG_FILE_LOCK_STATE.atomic_update = True
+        try:
+            save_config(cfg)
+        finally:
+            _CONFIG_FILE_LOCK_STATE.atomic_update = prev_atomic
+        return cfg, result
